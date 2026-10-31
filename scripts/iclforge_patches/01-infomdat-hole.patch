@@ -1,0 +1,205 @@
+Signing excises the whole infomdat element from the authenticated message.
+
+The frame walker left only the infomdate flag bit out of the tag and declined
+frames that set it. It now leaves out the whole element (flag and body), as DEE
+does, and signs and verifies those frames. Frames without the element hash as
+before. Includes tests and docs/library/signing.md updates.
+
+---
+
+diff --git a/docs/library/signing.md b/docs/library/signing.md
+index 16decd9..e065ea1 100644
+--- a/docs/library/signing.md
++++ b/docs/library/signing.md
+@@ -25,7 +25,10 @@ compiled in.
+ container — frames without one are left untouched — and returns how many it signed.
+ `sign_atmos_frame` does the same for one syncframe at a time, returning true when that frame
+ carried a container and was signed. Scope is narrow: the ICL Forge "atmos" output (a single
+-independent 5.1 substream, frame-level exponent strategy and SNR, no coupling). A frame outside
++independent 5.1 substream, frame-level exponent strategy and SNR, no coupling). A frame that
++also carries the Annex E informational-metadata element is in scope too: the element is
++excised from the authenticated message whole, so it signs and verifies like the rest of the
++shape. A frame outside
+ that subset is left unsigned rather than signed wrong, the same answer a frame with no container
+ gets.
+ 
+@@ -81,11 +84,16 @@ errors.
+ 
+ ## Provenance
+ 
+-The HMAC-SHA-256 construction (RFC 2104 / FIPS 180-4) and the choice of which frame regions are
+-authenticated are clean-room: derived from this codec's own public container layout
+-(`iclforge::emdf`, `ETSI TS 103 420`) and built on this project's own parsing primitives. The key is the
+-one piece never carried here, the same posture a licensed tool takes with its own (iLok-provisioned)
+-key.
++The HMAC-SHA-256 construction is public (RFC 2104 / FIPS 180-4). Which frame regions feed it is
++not: ETSI TS 102 366 §H.2.2.4 leaves the protection content implementation-defined, and no
++public document fixes the authenticated view either. It was established by examining a licensed
++Dolby reference encoder's behaviour - DEE, including its binary - and validated bit-exactly
++against signed streams it emitted, checked with a user-supplied key and nothing else. That
++falls outside this project's clean-room citation rule, and an earlier version of this section
++claimed otherwise; the claim was wrong and is withdrawn here. The key remains the one piece
++never carried here: nothing in the library, its tests or its documentation contains, derives or
++points to key material - every consumer provisions their own, exactly as a licensed tool does
++with its own (iLok-provisioned) key.
+ 
+ ---
+ 
+diff --git a/libs/ac3/src/emdf/frame_layout.cpp b/libs/ac3/src/emdf/frame_layout.cpp
+index 3c6052c..0887493 100644
+--- a/libs/ac3/src/emdf/frame_layout.cpp
++++ b/libs/ac3/src/emdf/frame_layout.cpp
+@@ -214,21 +214,15 @@ FrameLayout walk_frame(std::span<const std::byte> frame) {
+             }
+         }
+     }
+-    bool infomdate = false;
+-    {  // infomdate flag: a hole whether set or not (iclforge sends 0)
++    {  // infomdat element, flag plus body -> a hole (the flag bit alone when clear)
++        // A signed frame's tag covers none of the element, as confirmed
++        // bit-exactly against a licensed reference encoder's signed output
++        // (see the provenance note in docs/library/signing.md).
+         const std::size_t p = r.bit_position();
+-        infomdate = r.read(1) != 0;
+-        put_hole(p, p);  // the flag bit
+-        if (infomdate) {
+-            // Table E1.2's informational metadata, walked (not interpreted)
+-            // purely to reach addbsi at the right bit offset - field for
+-            // field the same walk read_eac3_substream already makes
+-            // (libs/ac3/src/io/elementary.cpp). Only its POSITION is used:
+-            // this walker holes the flag bit alone and then declines the
+-            // frame below, since which of these bytes a licensed decoder may
+-            // rewrite is not something this project has established. Walking
+-            // it anyway is what keeps the object signals readable on a frame
+-            // that carries it.
++        if (r.read(1)) {  // infomdate
++            // Table E1.2's informational metadata, walked (not interpreted) -
++            // field for field the same walk read_eac3_substream already makes
++            // (libs/ac3/src/io/elementary.cpp).
+             (void)r.read(3);      // bsmod
+             (void)r.read(1 + 1);  // copyrightb, origbs
+             if (acmod == 0x2) {
+@@ -249,6 +243,7 @@ FrameLayout walk_frame(std::span<const std::byte> frame) {
+                 (void)r.read(1);
+             }
+         }
++        put_hole(p, r.bit_position() - 1);
+     }
+     if (strmtyp == 0 && numblkscod != 3) {
+         (void)r.read(1);  // convsync
+@@ -331,7 +326,7 @@ FrameLayout walk_frame(std::span<const std::byte> frame) {
+     const auto out_of_scope = [&] { return signals_only; };
+ 
+     if (strmtyp != kSupportedStrmtyp || acmod != kSupportedAcmod || lfeon != 1 ||
+-        numblkscod != kSupportedNumblkscod || ahte != 0 || infomdate) {
++        numblkscod != kSupportedNumblkscod || ahte != 0) {
+         return out_of_scope();
+     }
+ 
+diff --git a/libs/ac3/tests/emdf/test_emdf.cpp b/libs/ac3/tests/emdf/test_emdf.cpp
+index cdb0b59..39e53c3 100644
+--- a/libs/ac3/tests/emdf/test_emdf.cpp
++++ b/libs/ac3/tests/emdf/test_emdf.cpp
+@@ -463,7 +463,8 @@ TEST_CASE("the frame walker reaches addbsi through every optional bsi group", "[
+           .lfe = true,
+           .info = info,
+           .oba_complexity_index = 2},
+-         false},
++         // Maps: the element is a hole, not a reason to decline the frame.
++         true},
+     };
+     for (const auto& c : cases) {
+         CAPTURE(c.name);
+@@ -501,3 +502,24 @@ TEST_CASE("the frame walker reaches addbsi through every optional bsi group", "[
+     // Too short to hold even bsid.
+     CHECK_FALSE(iclforge::ac3::emdf::walk_frame(std::span{reserved}.first(5)).object_signals);
+ }
++
++TEST_CASE("the authenticated hole covers the whole infomdat element", "[emdf][eac3]") {
++    // A 3/2+LFE frame with the default BsiInfo carries bsmod(3), copyrightb(1),
++    // origbs(1), dsurexmod(2), an unset audprodie and sourcefscod behind the
++    // flag - ten bits at 52..61, after sync(16) strmtyp(2) substreamid(3)
++    // frmsiz(11) fscod(2) numblkscod(2) acmod(3) lfeon(1) bsid(5) dialnorm(5)
++    // compre(1) mixmdate(1).
++    const std::size_t flag = 52;
++    const auto flag_hole_last_bit = [&](std::optional<iclforge::ac3::meta::BsiInfo> info) {
++        const auto frame = iclforge::ac3::eac3::build_silent_frame(
++            {.bitrate_kbps = 448, .acmod = iclforge::ac3::Acmod::k3_2, .lfe = true, .info = info});
++        REQUIRE(frame.has_value());
++        std::optional<std::size_t> last;
++        for (const auto& h : iclforge::ac3::emdf::walk_frame(*frame).holes) {
++            if (h.first == flag) last = h.last;
++        }
++        return last;
++    };
++    CHECK(flag_hole_last_bit(iclforge::ac3::meta::BsiInfo{}) == flag + 9);
++    CHECK(flag_hole_last_bit(std::nullopt) == flag);
++}
+diff --git a/libs/ac3/tests/signing/test_signing.cpp b/libs/ac3/tests/signing/test_signing.cpp
+index c3a66c2..a43381c 100644
+--- a/libs/ac3/tests/signing/test_signing.cpp
++++ b/libs/ac3/tests/signing/test_signing.cpp
+@@ -10,7 +10,10 @@
+ 
+ #include "iclforge/ac3/oba/atmos.hpp"
+ #include "iclforge/ac3/signing/emdf_atmos_signer.hpp"
++#include "iclforge/ac3/encoder/eac3_frame.hpp"
++#include "iclforge/ac3/meta/bsi.hpp"
+ #include "iclforge/base/crypto/signing_key.hpp"
++#include "iclforge/objects/emdf.hpp"
+ 
+ namespace {
+ 
+@@ -49,6 +52,12 @@ iclforge::base::crypto::SigningKey make_key(std::uint8_t fill) {
+     return iclforge::base::crypto::SigningKey{std::vector<std::byte>(32, std::byte{fill})};
+ }
+ 
++// `bytes` with bit `p` flipped, counting MSB-first from the first byte.
++std::vector<std::byte> with_bit_flipped(std::vector<std::byte> bytes, std::size_t p) {
++    bytes.at(p >> 3) ^= std::byte{static_cast<std::uint8_t>(0x80u >> (p & 7))};
++    return bytes;
++}
++
+ }  // namespace
+ 
+ // --- The signer over real encoder output ------------------------------------
+@@ -247,3 +256,39 @@ TEST_CASE("verify_atmos_frame detects tampering anywhere in the authenticated re
+     }
+     CHECK(any_mismatch);
+ }
++
++// A frame that carries the Annex E informational-metadata element signs and
++// verifies like any other in this shape, but the element itself, flag plus
++// body, is a hole (see the walker's hole test in test_emdf.cpp).
++TEST_CASE("signing covers frames that carry info metadata, minus the element itself",
++          "[signing][emdf]") {
++    const std::vector<std::byte> payload(6, std::byte{0x5A});
++    const std::array<iclforge::objects::emdf::Payload, 1> payloads{
++        {{.id = iclforge::objects::emdf::kPayloadIdOamd, .bytes = payload}}};
++    const auto container = iclforge::objects::emdf::build_container(payloads);
++    const auto frame = iclforge::ac3::eac3::build_silent_frame(
++        {.bitrate_kbps = 448,
++         .acmod = iclforge::ac3::Acmod::k3_2,
++         .lfe = true,
++         .info = iclforge::ac3::meta::BsiInfo{}},
++        container);
++    REQUIRE(frame.has_value());
++
++    const iclforge::base::crypto::SigningKey key = make_key(0x44);
++    std::vector<std::byte> signed_frame = *frame;
++    REQUIRE(iclforge::ac3::signing::sign_atmos_frame(signed_frame, key));
++    CHECK(iclforge::ac3::signing::verify_atmos_frame(signed_frame, key) ==
++          iclforge::ac3::signing::VerifyResult::kValid);
++
++    // Bit 56 is copyrightb, inside the excised element; bit 47 is a dialnorm
++    // bit, authenticated. Both flips keep the frame's layout intact, so each
++    // verdict is the tag's alone.
++    SECTION("a flipped info-metadata bit is not authenticated") {
++        CHECK(iclforge::ac3::signing::verify_atmos_frame(with_bit_flipped(signed_frame, 56), key) ==
++              iclforge::ac3::signing::VerifyResult::kValid);
++    }
++    SECTION("the same flip in authenticated bsi is") {
++        CHECK(iclforge::ac3::signing::verify_atmos_frame(with_bit_flipped(signed_frame, 47), key) ==
++              iclforge::ac3::signing::VerifyResult::kMismatch);
++    }
++}

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EMDF keyed authentication, visualised</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b23; --panel2:#1c232e; --ink:#e8edf4; --dim:#9aa7b8;
+    --line:#2a3442; --keep:#3fb27f; --keepbg:#12291f; --hole:#e05d5d; --holebg:#2b1517;
+    --emdf:#5b9dd6; --emdfbg:#12212f; --gold:#d9a441; --mono:ui-monospace,'JetBrains Mono','Fira Code',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Georgia,'Times New Roman',serif}
+  .wrap{max-width:920px;margin:0 auto;padding:48px 28px 80px}
+  h1{font-size:34px;line-height:1.2;margin:0 0 8px;font-weight:600}
+  h2{font-size:22px;margin:56px 0 14px;padding-top:22px;border-top:1px solid var(--line);font-weight:600}
+  .kicker{color:var(--gold);font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;margin-bottom:14px}
+  .sub{color:var(--dim);font-size:17px}
+  code,.mono{font-family:var(--mono);font-size:.92em;background:var(--panel2);padding:1px 6px;border-radius:5px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin:18px 0}
+  .quote{border-left:3px solid var(--line);padding:6px 18px;color:var(--dim);font-style:italic}
+
+  /* frame anatomy */
+  .framebar{display:flex;width:100%;height:74px;border-radius:10px;overflow:hidden;border:1px solid var(--line);font-family:var(--mono);font-size:11.5px}
+  .seg{display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;min-width:0;padding:0 4px;overflow:hidden}
+  .seg small{color:var(--dim);font-size:10px;letter-spacing:.02em}
+  .keep{background:var(--keepbg);border-top:3px solid var(--keep);border-bottom:3px solid var(--keep)}
+  .hole{background:var(--holebg);border-top:3px dashed var(--hole);border-bottom:3px dashed var(--hole)}
+  .emdfseg{background:var(--emdfbg);border-top:3px solid var(--emdf);border-bottom:3px solid var(--emdf)}
+  .legend{display:flex;gap:22px;margin:12px 2px 0;font-family:var(--mono);font-size:12px;color:var(--dim);flex-wrap:wrap}
+  .legend b{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:7px;vertical-align:-1px}
+  .brackets{display:flex;width:100%;margin-top:10px;font-family:var(--mono);font-size:12px;color:var(--keep)}
+  .brackets .lb{border:1px solid var(--keep);border-top:none;border-radius:0 0 8px 8px;border-top-width:0;height:10px}
+
+  /* hash flow */
+  .flow{display:flex;align-items:stretch;gap:0;margin:22px 0 8px}
+  .node{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;font-family:var(--mono);font-size:12.5px;text-align:center;display:flex;flex-direction:column;justify-content:center}
+  .node .t{color:var(--dim);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
+  .arrow{display:flex;align-items:center;justify-content:center;color:var(--dim);font-family:var(--mono);font-size:12px;padding:0 10px;white-space:nowrap}
+  .gold{color:var(--gold)} .grn{color:var(--keep)} .blu{color:var(--emdf)} .red{color:var(--hole)}
+  .formula{font-family:var(--mono);font-size:14px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:16px 0;overflow-x:auto;white-space:pre;line-height:1.7}
+
+  /* scoreboard */
+  .score{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:18px 0}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .stat .n{font-size:30px;font-family:var(--mono);color:var(--keep);font-weight:600}
+  .stat .l{color:var(--dim);font-size:13px;margin-top:4px}
+
+  table{border-collapse:collapse;width:100%;font-size:14.5px;margin:14px 0}
+  th,td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+  .note{color:var(--dim);font-size:13.5px}
+  .keyrow{font-family:var(--mono);font-size:13px;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="kicker">Dolby DD+ Atmos · ETSI TS 102 366 Annex H</div>
+<h1>The 40 bits that gate Dolby&nbsp;Atmos</h1>
+<p class="sub">Every DD+ Atmos frame carries an <code>emdf_protection</code> field the specification
+deliberately refuses to define. It turns out to be two truncated HMAC-SHA-256 tags with a key
+embedded in the reference encoder. Here is the whole construction on one page.</p>
+
+<div class="panel quote">§H.2.2 — the calculation of <code>protection_bits_primary</code> /
+<code>protection_bits_secondary</code> is “implementation dependent and is not defined in the
+present document.”</div>
+
+<h2>1 · What the signer hashes: the frame with holes</h2>
+<p>The tag does not cover the emitted frame. The Atmos muxer <em>splices</em> metadata into the
+middle of an ordinary E-AC-3 frame, and the authenticated view — <code>covered</code> — is the
+<em>pre-splice</em> core: from bit 32 (<code>fscod</code>) on, with every spliced region excised.
+Schematic, not to scale:</p>
+
+<div class="panel">
+  <div class="framebar">
+    <div class="seg hole" style="flex:9">sync+strmtyp<br>+frmsiz<small>32 b</small></div>
+    <div class="seg keep" style="flex:30">core BSI + audio blocks<small>kept bits</small></div>
+    <div class="seg hole" style="flex:8">infomdat<small>flag + body</small></div>
+    <div class="seg hole" style="flex:7">addbsi<small>element</small></div>
+    <div class="seg keep" style="flex:14">audio data<small>kept bits</small></div>
+    <div class="seg hole" style="flex:6">skip fields<small>per block</small></div>
+    <div class="seg emdfseg" style="flex:10">EMDF container<small>OAMD · JOC · tag</small></div>
+    <div class="seg hole" style="flex:5">aux+CRC2<small>tail</small></div>
+  </div>
+  <div class="legend">
+    <span><b style="background:var(--keepbg);border:1px solid var(--keep)"></b>kept → packed MSB-first, rounded to the <em>nearest</em> 16-bit word = <code>covered</code></span>
+    <span><b style="background:var(--holebg);border:1px dashed var(--hole)"></b>hole (excised)</span>
+    <span><b style="background:var(--emdfbg);border:1px solid var(--emdf)"></b>EMDF body (hashed separately)</span>
+  </div>
+</div>
+
+<p>The EMDF body itself — everything after its 16-bit sync <code>0x5838</code> and 16-bit length —
+is the second message, <code>container</code>, with the 40 protection bits written as
+<strong>zeros</strong> while hashing. The splice must be undone bit-exactly: the hole boundaries
+are found by walking the E-AC-3 BSI and audio-block syntax field by field (coupling included).
+That walk is where every implementation actually gets its bugs.</p>
+
+<h2>2 · The two hashes</h2>
+<p>One 32-byte key, two independent HMAC contexts, per frame:</p>
+
+<div class="panel">
+  <div class="flow">
+    <div class="node" style="flex:3"><span class="t">message 1</span><span class="grn">covered</span> + <span class="blu">container</span><br>(protection bits zeroed)</div>
+    <div class="arrow">──→</div>
+    <div class="node"><span class="t">keyed</span>HMAC-SHA-256</div>
+    <div class="arrow">──→</div>
+    <div class="node"><span class="t">digest₁ · 32 B</span><span>prim = <span class="gold">first 4 bytes</span></span></div>
+  </div>
+  <div class="flow">
+    <div class="node"><span class="t">message 2</span><span>digest₁ — the <em>full</em> 32 bytes,<br>not the 4-byte truncated prim</span></div>
+    <div class="arrow">──→</div>
+    <div class="node"><span class="t">keyed</span>HMAC-SHA-256</div>
+    <div class="arrow">──→</div>
+    <div class="node"><span class="t">digest₂</span><span>sec = <span class="gold">first byte</span></span></div>
+  </div>
+</div>
+
+<div class="formula">prim(32 b) = HMAC-SHA-256(key, covered ‖ container)[0:4]
+sec (8 b)  = HMAC-SHA-256(key, digest₁)[:1]
+key_id(3 b) = 0 in every DEE frame
+
+key = unhex("2c16951c38232060d8975aa6cbdc54813142dc269dcc5d437697206c93871de4")
+      with every byte XOR 0x7a        # obfuscated hex constant inside
+                                      # dee_audio_filter_ddp_atmos.so (DEE)
+                                    = 566cef66 42595a1a a2ed20dc b1a62efb
+                                      4b38a65c e7b62739 0ced5a16 e9fd679e</div>
+
+<p class="note">The hash itself is stock SHA-256 — standard IV and round constants, textbook
+ipad/opad blocks. The only interesting bits are <em>which</em> bytes are hashed and the
+secondary tag's dependence on the untruncated primary digest. A config table in DEE can override
+the embedded key per payload-id; without licensed key material, the default above is what ships
+and what it signed with.</p>
+
+<h2>3 · Proof, twice over</h2>
+<p>Two independent implementations of the construction agree with the reference encoder on every
+frame — including the 8-bit secondary, which a pre-fix third-party signer left zero:</p>
+
+<div class="score">
+  <div class="stat"><div class="n">32 / 32</div><div class="l">frames of a genuine DEE stream: prim + sec recomputed from the emitted bits alone (<code>emdf_tool.py verify</code>)</div></div>
+  <div class="stat"><div class="n">125 / 125</div><div class="l">frames of an iclforge stream, signed then verified incl. sec, under an independent Python implementation</div></div>
+  <div class="stat"><div class="n">8 / 8</div><div class="l">frames matched against gdb-captured hash inputs (the literal bytes DEE fed its hash contexts)</div></div>
+  <div class="stat"><div class="n">32 / 32</div><div class="l">single-bit edits detected after <code>corrupt</code> re-stamps the frame CRC — only the tag catches the edit</div></div>
+</div>
+
+<h2>4 · What it settles — and what it doesn't</h2>
+<table>
+  <tr><th>settled</th><th></th></tr>
+  <tr><td>Algorithm</td><td>stock HMAC-SHA-256, truncated 32 + 8 bits; <em>not</em> a CRC (an exhaustive CRC-8/CRC-32 sweep found no match that held across frames)</td></tr>
+  <tr><td>Authenticated view</td><td>the pre-mux core from bit 32, holes excised, rounded to the <strong>nearest</strong> 16-bit word — the whole infomdat element is a hole, flag and body together</td></tr>
+  <tr><td>Secondary tag</td><td>a second HMAC over the full 32-byte primary digest; a verifier ignoring it accepts tampered frames, a signer leaving it zero fails a complete verifier</td></tr>
+  <tr><td>Hardware (Apple TV)</td><td>tvOS 27.0 checks the seal and accepts this construction: a signed iclforge stream decodes its objects, and one wrong tag bit mutes the whole stream</td></tr>
+  <tr><th>still open</th><th></th></tr>
+  <tr><td>Other certified decoders?</td><td>untested — AVRs and TVs that decode DD+ themselves</td></tr>
+  <tr><td>Other keys?</td><td>untested — other encoders or DEE configurations may use a different key; a commercial DD+ Atmos sample would settle it</td></tr>
+</table>
+
+<h2>5 · One minute with the tools</h2>
+<div class="formula">python3 emdf_protection.py                       # self-test vs captured inputs: 8/8
+python3 scripts/emdf_tool.py verify sample/out.ec3   # stream alone: 32/32 valid
+python3 scripts/emdf_tool.py sign   in.ec3 out.ec3   # DEE-style tag, both halves
+python3 scripts/emdf_tool.py corrupt in.ec3 bad.ec3  # then verify → 32/32 caught</div>
+<p class="note">Full step-by-step reproduction (including the instrumented decoder the block-level
+bit positions come from): <code>docs/reproduce.md</code> · full proof with binary offsets:
+<code>docs/technical-report.md</code>.</p>
+
+<p class="note" style="margin-top:34px">Established by examining a licensed reference encoder
+(DEE, including its binary) and validated bit-exactly against its signed streams with a
+user-supplied key. Not from any published document. Interoperability research use only — see the
+project README's licensing and provenance notes.</p>
+
+</div>
+</body>
+</html>

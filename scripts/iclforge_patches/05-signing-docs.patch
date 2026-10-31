@@ -1,0 +1,541 @@
+Docs: default signing, the built-in key, the clean-room exception, and the hardware result.
+
+Updates the signing and clean-room documentation to match 04: E-AC-3 Atmos
+signs automatically with the built-in DEE key, and that key plus its
+authenticated-region layout are not clean-room (recovered from DEE, not a
+standard). Records the hardware result: an Apple TV 4K on tvOS 27.0
+reconstructs the objects of a default-signed stream and mutes the same stream
+with one tag bit flipped. Apply after 04-default-signing.
+
+---
+
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 70e2ee4..4fb654e 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -72,6 +72,9 @@ This is the constraint the whole project rests on. Breaking it makes the code un
+   implementation of it.
+ - Where a standard is ambiguous or contradicts itself, the reading taken and its evidence go in
+   an `ERRATA.md` beside the code (`libs/ac4/ERRATA.md`, `libs/ac4/ERRATA.md`).
++- **One deliberate exception: EMDF object signing.** Its key and the frame regions it covers were
++  recovered from the Dolby Encoding Engine, not transcribed from a standard, so `iclforge::ac3::signing`
++  (and `dee_default_signing_key()`) is not clean-room. See [Object signing](docs/concepts/object-signing.md).
+ 
+ If you cannot cite where something came from, it does not go in.
+ 
+@@ -360,10 +363,11 @@ say so in the commit message and hold the change to the standard's own tables an
+ the tests there do.
+ 
+ **Object reconstruction has none of the four.** Dolby's tooling above verifies the object
+-layer's *syntax*, not its audio: that decoder gates object decoding on a keyed authenticity tag
+-this project ships no key for, so it renders these streams as their 5.1 bed, and FFmpeg
+-implements no JOC reconstruction at all. Nothing outside this repository can produce an
+-independent object decode of an ICL Forge stream. What exists instead is a self-consistency
++layer's *syntax*, not its audio: that decoder gates object decoding on a keyed authenticity tag,
++and FFmpeg implements no JOC reconstruction at all. The one independent object decode so far is
++tvOS's, which accepts this project's default-signed tag
++([Object signing](docs/concepts/object-signing.md#tested-on-hardware)): a one-off device check,
++not something CI can run. What exists instead is a self-consistency
+ series with real resolution — `tools/ci/quality_race.py`'s `objects` mode scores a committed
+ five-object scene per object per rate in the nightly run, trended at [Object quality
+ trend](https://iainchesworthlabs.github.io/iclforge/object-quality-trend/). If you are changing
+diff --git a/README.md b/README.md
+index c34fdc6..ef05c9f 100644
+--- a/README.md
++++ b/README.md
+@@ -30,7 +30,9 @@
+ [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+ 
+ ICL Forge is a clean-room AC-3, E-AC-3, AC-4 and Dolby Atmos codec, written from the published
+-standards in C++23, and the applications built on it.
++standards in C++23, and the applications built on it. The one exception is EMDF object signing,
++whose key and authenticated layout were recovered from the Dolby Encoding Engine (see
++[Object signing](docs/concepts/object-signing.md)); E-AC-3 Atmos encodes use that key by default.
+ 
+ | Component | What it is | Docs |
+ |---|---|---|
+diff --git a/docs/concepts/atmos-joc.md b/docs/concepts/atmos-joc.md
+index 5b2064b..06f611d 100644
+--- a/docs/concepts/atmos-joc.md
++++ b/docs/concepts/atmos-joc.md
+@@ -198,19 +198,19 @@ of parametric object coding rather than a defect in this encoder: the side infor
+ *how much* energy came from where, not a per-object recording, so directly overlapping objects
+ are approximated.
+ 
+-**Dolby's own decoder additionally requires an authenticity tag, and that tag needs a key you
+-provide.** Beyond the spec, a Dolby-licensed decoder gates object decoding on a keyed HMAC carried
+-in the stream's EMDF protection field. A stream from this encoder is spec-correct — it validates
+-against independent tooling and the bed decodes correctly — but unless that tag is present and
+-valid, the licensed decoder falls back to playing just the plain 5.1 bed rather than
+-reconstructing the objects. This is an authenticity gate, not a correctness or conformance problem.
+-
+-The signer that produces the tag ships in the tree (`iclforge::ac3::signing`): the HMAC construction and the
+-layout of what gets signed are clean-room and committed, and the **only** thing you supply is the
+-key — provisioned at runtime, never embedded, the same way a licensed tool receives its own. With a
+-matching key, a validating decoder reconstructs the objects; without one, the stream stays a valid
+-Atmos-in-E-AC-3 stream that plays as 5.1 on that decoder. See
+-[Object signing](object-signing.md) for the full picture and how to turn it on.
++**Dolby's own decoder additionally requires an authenticity tag.** Beyond the spec, a
++Dolby-licensed decoder gates object decoding on a keyed HMAC carried in the stream's EMDF
++protection field. A stream from this encoder is spec-correct — it validates against independent
++tooling and the bed decodes correctly — but unless that tag is present and valid, a licensed
++decoder plays just the plain 5.1 bed rather than reconstructing the objects, or, as tvOS does,
++mutes the stream. This is an authenticity gate, not a correctness or conformance problem.
++
++The signer that produces the tag ships in the tree (`iclforge::ac3::signing`) and runs by default,
++with the key DEE itself uses — recovered from its binary, so this part is not clean-room. Every
++E-AC-3 Atmos encode is signed automatically; a validating decoder then reconstructs the objects
++(tvOS does: [Tested on hardware](object-signing.md#tested-on-hardware)), and `sign-objects=off`
++leaves the stream a plain 5.1-playing Atmos-in-E-AC-3 file. See
++[Object signing](object-signing.md) for the full picture.
+ 
+ !!! example "See it in code"
+     - [Spatial & Atmos objects](../library/spatial-and-atmos.md)
+diff --git a/docs/concepts/index.md b/docs/concepts/index.md
+index 4a2fe8b..5927260 100644
+--- a/docs/concepts/index.md
++++ b/docs/concepts/index.md
+@@ -65,7 +65,9 @@ covers what it is and how much of it ICL Forge implements.
+ ## Why this project exists
+ 
+ ICL Forge is a clean-room implementation: it is built entirely from the published standards
+-above, not by studying or reusing any existing codec's code. It links no other codec library —
++above, not by studying or reusing any existing codec's code. The one exception is EMDF object
++signing — its key and authenticated-region layout come from examining the Dolby Encoding Engine,
++not a public standard (see [Object signing](object-signing.md)). It links no other codec library —
+ not even to decode. During development, FFmpeg is used only as an independent, external pair
+ of eyes: AC-3 and E-AC-3 encoder output gets checked against FFmpeg's own decoder as a sanity
+ check, but the project never depends on FFmpeg to build or run. FFmpeg has no AC-4 decoder, so
+diff --git a/docs/concepts/object-signing.md b/docs/concepts/object-signing.md
+index e7b0ba7..dcf1eb4 100644
+--- a/docs/concepts/object-signing.md
++++ b/docs/concepts/object-signing.md
+@@ -4,32 +4,32 @@ A clean-room Atmos stream from this encoder is a valid Atmos-in-E-AC-3 stream: t
+ everywhere, and the JOC/OAMD object metadata is spec-correct. But a **Dolby-licensed decoder**
+ does one extra thing before it will reconstruct the objects — it checks a keyed authenticity tag
+ carried in the stream's EMDF *protection* field. Without a valid tag it plays the plain 5.1 bed
+-instead of the height-rendered objects (see [Atmos & JOC](atmos-joc.md#two-limitations)).
++instead of the height-rendered objects, or, as tvOS does, nothing at all (see
++[Atmos & JOC](atmos-joc.md#two-limitations) and [Tested on hardware](#tested-on-hardware)).
+ 
+ `iclforge::ac3::signing` computes that tag.
+ 
+-## The library has no key — you provide it
++## It ships with the key, and signs by default
+ 
+ This is the one thing to take away from this page:
+ 
+-> **`iclforge::ac3::signing` contains no key, and never will. Every user of the library supplies their own
+-> key at runtime — this project's own tools included, and any consumer outside this project
+-> equally.** The library cannot sign anything until *you* hand it a key.
++> **Every E-AC-3 Atmos encode is signed automatically, with the key the Dolby Encoding Engine
++> itself uses.** You do not provision anything; pass `sign-objects=off` to opt out, or
++> `signing-key=<path>` to sign with a different key instead.
+ 
+-That is a deliberate design boundary, not a gap to be filled later. The signer holds no embedded
+-key, reads none from the build, and has no way to obtain or derive one. What it ships is only the
+-*algorithm*:
++That key, and the frame regions it covers, were established by examining DEE's own signed output,
++not derived from a public standard — so this part of the library is **not clean-room** (see
++[Provenance](../library/signing.md#provenance)). What ships:
+ 
+ | Part | Where it comes from | In the library? |
+ |---|---|---|
+ | **HMAC-SHA-256** | FIPS 180-4 / RFC 2104, public standards | Yes — `libs/base/src/crypto/`, dependency-free |
+-| **What gets authenticated** — which frame regions feed the HMAC, and where the tag is written | Not in any public document (TS 102 366 §H.2.2.4 leaves the protection content implementation-defined) — established against a licensed reference encoder's signed output; see [Provenance](../library/signing.md#provenance) | Yes — `libs/ac3/src/signing/emdf_atmos_signer.cpp` |
+-| **The key** | You provision it — exactly as a licensed tool (DEE) receives its own via iLok | **No — never** |
++| **What gets authenticated** — which frame regions feed the HMAC, and where the tag is written | Not in any public document (TS 102 366 §H.2.2.4 leaves the protection content implementation-defined) — established against DEE's signed output | Yes — `libs/ac3/src/signing/emdf_atmos_signer.cpp` |
++| **The key** | DEE's own embedded key, recovered from its binary | Yes — `dee_default_signing_key()`; override with `signing-key=` |
+ 
+-A stream signed with a key that does not match a given decoder's simply fails that decoder's check,
+-exactly as an unsigned one does. Providing a key that a particular licensed decoder accepts — and
+-being entitled to use it — is entirely the library user's responsibility, whether that user is this
+-project or someone building on `iclforge::ac3::signing` elsewhere.
++The built-in key is what makes a licensed decoder accept the objects. Using it, and being entitled
++to, is the user's responsibility — this project's tools and anyone building on
++`iclforge::ac3::signing` alike.
+ 
+ !!! note "The tag construction, precisely"
+     `tag = HMAC-SHA-256(key, A ‖ B)`, truncated to the primary protection field's width.
+@@ -41,6 +41,26 @@ project or someone building on `iclforge::ac3::signing` elsewhere.
+     verification checks it alongside the primary. Frames with no object container are left
+     untouched.
+ 
++## Tested on hardware
++
++An Apple TV 4K (2nd generation) on tvOS 27.0 accepts the default-signed tag. Two 7.1.4
++programmes, a spoken height check and a heights-only demo, were encoded with `forge atmos-cbi` at
++768 kbps, each beside a DEE 5.2.1 encode of the same WAV, and played with AVPlayer into a Samsung
++HW-Q990C. tvOS's E-AC-3 JOC decoder was also run in process (`'ec+3'` through `AVAudioConverter`)
++to read each output channel's level.
++
++- **Signed:** tvOS reconstructs the objects. Each height channel's content came out of the
++  matching height output and nothing leaked into the surrounds. In a blind listen beside DEE's
++  encode, both played the heights-only demo overhead.
++- **One primary-tag bit flipped per frame**, with `crc2` re-stamped and nothing else changed:
++  tvOS outputs silence, in playback and in the in-process decode alike. It mutes the stream
++  rather than falling back to the bed.
++- **Level:** this encoder writes `joc_clipgain_x_bits` as 0, which this project's decoder reads as
++  unity but tvOS applies as exactly 1/16 (-24 dB) to the reconstructed objects. DEE writes 4; with
++  4, tvOS's object levels matched this project's own decode within 0.2 dB.
++
++Only this device and OS were tested; other certified decoders may gate differently.
++
+ ## Verifying a tag this signer wrote
+ 
+ `iclforge::ac3::signing` also checks its own tag: `verify_atmos_frame`/`verify_atmos_stream` recompute the
+@@ -117,27 +137,26 @@ in the library reference for the rest of the API surface.
+ Everything below is just *how the two front ends in this repository supply their own key* — worked
+ examples of the rule above, not additional machinery.
+ 
+-## How this project supplies its key
++## How the key is supplied
+ 
+ ### Desktop CLI
+ 
+-Signing is **off unless you both ask for it and provide a key**:
++Every E-AC-3 Atmos encode (`atmos`, `atmos-path`, `atmos-encode`, `atmos-cbi`, `atmos-adm`,
++`atmos-iab`) signs with the built-in DEE key automatically:
+ 
+ ```bash
+-forge atmos out.ec3 8 448 4 6 objects sign-objects signing-key=/path/to/atmos.key
++forge atmos out.ec3 8 448 4 6 objects
+ ```
+ 
+-- `sign-objects` requests signing.
+-- `signing-key=<path>` names the key file (preferred — a path doesn't leak into `ps`/shell history).
+-- Or, instead of `signing-key=`, set `ICLFORGE_SIGNING_KEY_FILE` (a path) or `ICLFORGE_SIGNING_KEY`
+-  (the key inline, base64 or raw) — the same resolver order `load_signing_key()` uses.
+-
+-`sign-objects` with no key anywhere is a hard error (it won't silently ship an unsigned stream); no
+-`sign-objects` leaves the container unsigned, and — because a decoder that validates the tag can
+-refuse an unsigned-but-present container instead of falling back to the bed (the receiver in the
+-[Raspberry Pi test](../platforms/raspberry-pi.md#live-hdmi-passthrough-to-a-real-receiver) fell
+-back) — you'll usually want `mode bed51` there so the stream omits the container and plays as 5.1
+-everywhere. See [CLI metadata options](../forge/cli/metadata-options.md).
++- To sign with a different key, pass `signing-key=<path>` (preferred — a path doesn't leak into
++  `ps`/shell history), or set `ICLFORGE_SIGNING_KEY_FILE` (a path) or `ICLFORGE_SIGNING_KEY` (the
++  key inline, base64 or raw) — the resolver order `load_signing_key()` uses, with the built-in key
++  last.
++- `sign-objects=off` leaves the container unsigned; combine with `mode bed51` if you want a stream
++  that plays as plain 5.1 everywhere (an unsigned-but-present container can make a validating
++  decoder refuse the objects rather than fall back to the bed, and tvOS mutes a stream whose tag
++  does not match). See
++  [CLI metadata options](../forge/cli/metadata-options.md).
+ 
+ `decode`/`monitor` have the mirror-image option, `verify-objects`, to check a stream's tag instead
+ of writing one:
+@@ -146,17 +165,16 @@ of writing one:
+ forge decode signed.ec3 out.wav verify-objects signing-key=/path/to/atmos.key
+ ```
+ 
+-- Checking is **just as opt-in as signing**: `verify-objects` is off by default, and a `decode` or
+-  `monitor` invocation with no `verify-objects` plays a signed stream exactly like an unsigned one —
+-  it never routes through the checker at all. `Eac3Decoder` itself never gains any knowledge of
+-  `iclforge::ac3::signing`; the check runs separately, over the same raw stream bytes, and only when the
+-  operator asks for it.
+-- With `verify-objects` and a key, every frame's tag is checked and a summary is reported
+-  (`N valid, M mismatched, K unsigned`). Any mismatch is a hard failure — the command refuses,
+-  exactly like `sign-objects` refuses a request with no key — rather than decoding some frames and
+-  silently skipping others: a signed stream is either verified or the command refuses, never a
+-  silent partial pass.
+-- `verify-objects` with no key anywhere is the same hard error `sign-objects` gives.
++- Checking is opt-in: `verify-objects` is off by default, and a `decode` or `monitor` invocation
++  without it plays a signed stream exactly like an unsigned one — it never routes through the
++  checker at all. `Eac3Decoder` itself never gains any knowledge of `iclforge::ac3::signing`; the
++  check runs separately, over the same raw stream bytes, and only when the operator asks for it.
++- With `verify-objects`, every frame's tag is checked and a summary is reported
++  (`N valid, M mismatched, K unsigned`). Any mismatch is a hard failure — the command refuses —
++  rather than decoding some frames and silently skipping others: a signed stream is either verified
++  or the command refuses, never a silent partial pass.
++- `verify-objects` with no `signing-key=` checks against the built-in DEE key, so it verifies a
++  default-signed stream out of the box.
+ - A frame with no object container (a plain AC-3/E-AC-3 stream, or an Atmos `bed51` stream) reports
+   as unsigned, not as a mismatch — there is nothing in it to check.
+ 
+@@ -209,24 +227,21 @@ for decode into multi-channel / objects — only the first two ship today:
+ | **Verify** | Multi-key HMAC QC; mismatch **fails** the command | Partial — single `signing-key=` only; keyring not yet |
+ | **Licensed** | AVR-like: match → reconstruct; mismatch / unsigned → **bed only**, decode continues | Not started — e.g. future `gate-objects` |
+ 
+-Sign remains single-key (`sign-objects`). Keys are always operator-provisioned; nothing here forges
+-a licensed decoder's secret.
++Sign uses the built-in DEE key by default, or a single `signing-key=` override.
+ 
+ ## What this is not
+ 
+-- **Not a key you get from us.** The library ships the machinery, never a key — see above. Whoever
+-  uses it, in this project or outside it, brings their own and is responsible for being entitled to
+-  use it.
+-- **Not a reconstruction of Dolby's own tag algorithm.** The construction here is derived from the
+-  public container layout, not from a licensed decoder. Whether a given decoder accepts a tag
+-  depends on the key *you* supply matching that decoder's expectation.
+-- **`verify-objects`/`verify_atmos_stream` are not a Dolby-decoder compatibility check either.**
+-  They check this library's own tag, computed with a key *you* supply — useful for round-trip
+-  testing and catching tampering in this project's own signed assets, but a `kValid` result says
+-  nothing about whether any particular licensed decoder would accept the same stream, and a
+-  `kMismatch` says nothing about why a licensed decoder might refuse one. Nothing in this project
+-  reconstructs or replicates Dolby's own gate — see the opening paragraph above.
++- **Not a licensed or endorsed path.** The built-in key and the authenticated-region layout were
++  recovered from DEE's output, not licensed from Dolby. Using them is the user's responsibility.
++- **Tested on one device.** The tag matches DEE's bit for bit and tvOS accepts it
++  ([Tested on hardware](#tested-on-hardware)); other certified decoders are untested, and this
++  project cannot promise they reconstruct the objects.
++- **`verify-objects`/`verify_atmos_stream` are a round-trip check, not a Dolby-decoder compatibility
++  check.** They confirm a stream carries a tag this signer would produce for the given key — useful
++  for catching tampering or corruption — but a `kValid` result says nothing about whether a
++  particular licensed decoder would accept the stream.
+ - **Not required for object motion to be audible.** `AtmosEncoder` pans every object into the
+-  transmitted 5.1 bed regardless of signing, so movement is audible on any decoder — signing is
++  transmitted 5.1 bed regardless of signing, so movement is audible on any decoder that ignores
++  the tag or falls back to the bed (tvOS does neither: a mismatched tag mutes it) — signing is
+   what lets a validating decoder reconstruct the objects as *discrete, height-rendered* sources
+   rather than panned into the bed. See [Atmos & JOC](atmos-joc.md).
+diff --git a/docs/conformance-vectors.md b/docs/conformance-vectors.md
+index 233a759..0ed875e 100644
+--- a/docs/conformance-vectors.md
++++ b/docs/conformance-vectors.md
+@@ -160,7 +160,7 @@ ICLFORGE_SIGNING_KEY_FILE=/path/to/key python tools/generators/gen_conformance_v
+ ```
+ 
+ Without a key `--sign` is refused outright rather than silently producing an unsigned stream
+-under a signed name. No key ships with this project and none is invented by the generator.
++under a signed name. The generator invents no key; it uses only the one passed to it.
+ 
+ ## Licensing
+ 
+diff --git a/docs/forge/cli/metadata-options.md b/docs/forge/cli/metadata-options.md
+index d2d8a6c..5f208e2 100644
+--- a/docs/forge/cli/metadata-options.md
++++ b/docs/forge/cli/metadata-options.md
+@@ -155,12 +155,13 @@ metadata options (any order, after the positional arguments):
+                     pair, ~233 KB together, which does not fit on every target the library
+                     builds for (see docs/platforms/bare-metal/esp32-s3.md). Harmless on a
+                     stream with no object layer
+-  sign-objects      atmos/atmos-path/atmos-encode/atmos-cbi: write a keyed EMDF object
+-                    signature (needs signing-key=); see docs/concepts/object-signing.md
+-  verify-objects    decode/monitor: check each frame's EMDF object signature against
+-                    signing-key= instead of just playing it - a mismatch refuses the command;
+-                    omitted (the default) decodes signed and unsigned streams alike, unchecked
+-  signing-key=<path>  the key file sign-objects/verify-objects use (or
++  sign-objects=off  atmos/atmos-path/atmos-encode/atmos-cbi/atmos-adm/atmos-iab: leave the
++                    EMDF object container unsigned - every such encode signs it by default;
++                    see docs/concepts/object-signing.md
++  verify-objects    decode/monitor: check each frame's EMDF object signature instead of just
++                    playing it - a mismatch refuses the command; omitted (the default) decodes
++                    signed and unsigned streams alike, unchecked
++  signing-key=<path>  a key file to sign/verify with instead of the built-in DEE key (or
+                     ICLFORGE_SIGNING_KEY_FILE / ICLFORGE_SIGNING_KEY)
+   verify            eac3-encode: decode every access unit as it is encoded and diff the
+                     decoder's model against the encoder's own, refusing the run at the first
+@@ -1288,14 +1289,13 @@ Optional positional arguments, when omitted:
+   out: no `Atmos complexity` line from `scan`, no Atmos extension in the `dec3` box `fmp4`
+   builds, no `CHANNELS="<N>/JOC"` in its playlists, and no "+ Dolby Atmos" from FFmpeg. See
+   [Atmos & JOC](../../concepts/atmos-joc.md) for why a decoder can tell the difference at all.
+-- **`sign-objects`** (with **`signing-key=<path>`**): signs the object container's EMDF protection
+-  tag so a validating decoder reconstructs the objects instead of playing the bed. Honored by
+-  `atmos`, `atmos-path`, `atmos-encode` and `atmos-cbi`; `atmos-adm` and `atmos-iab` do not take
+-  it, and an AC-4 object stream (`codec=ac4`) has no such container to sign, so it is refused
+-  there. Off unless you pass both — `sign-objects` alone with no key is an error. The key may also come from
+-  `ICLFORGE_SIGNING_KEY_FILE` / `ICLFORGE_SIGNING_KEY` instead of `signing-key=`. The key is never
+-  stored by the tool; the algorithm is in-tree but the key is yours to provision. Full details in
+-  [Object signing](../../concepts/object-signing.md).
++- **`sign-objects=off`**: every E-AC-3 Atmos encode (`atmos`, `atmos-path`, `atmos-encode`,
++  `atmos-cbi`, `atmos-adm`, `atmos-iab`) signs the object container's EMDF protection tag by
++  default, with the built-in DEE key, so a validating decoder reconstructs the objects instead of
++  playing the bed. `sign-objects=off` leaves it unsigned. Pass **`signing-key=<path>`** (or
++  `ICLFORGE_SIGNING_KEY_FILE` / `ICLFORGE_SIGNING_KEY`) to sign with a different key. An AC-4 object
++  stream (`codec=ac4`) has no such container, so an explicit `sign-objects` there is refused. Full
++  details in [Object signing](../../concepts/object-signing.md).
+ - **`fast-mdct=off`**: every encode runs the §7.9.4 fast forward MDCT by default (the quality
+   evidence that made it the default: ~3e-12 max relative coefficient error against the direct
+   form, 331 dB direct-vs-fast end-to-end SNR, 0.000 dB SNR delta against an independent oracle
+diff --git a/docs/index.md b/docs/index.md
+index dcfd1df..436ad2e 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -1,7 +1,9 @@
+ # ICL Forge
+ 
+ ICL Forge is a clean-room C++23 implementation of AC-3, E-AC-3, and Dolby Atmos decoding and
+-encoding, and of AC-4 decoding and encoding. The repository contains the codec library and three
++encoding, and of AC-4 decoding and encoding — the one exception being EMDF object signing, whose
++key was recovered from the Dolby Encoding Engine and is used by default (see
++[Object signing](concepts/object-signing.md)). The repository contains the codec library and three
+ applications built on it. AC-4 is in the library, in `forge`, in the Forge GUI, in the Hearth
+ desktop player, and in the C, Python, Rust, and WebAssembly bindings. Crucible does not use it,
+ and no ESP32 network sink decodes it in a Sendspin group.
+diff --git a/docs/library/capabilities.md b/docs/library/capabilities.md
+index 6dc9eb1..00b30be 100644
+--- a/docs/library/capabilities.md
++++ b/docs/library/capabilities.md
+@@ -221,8 +221,8 @@ load-bearing enough to flag up front:
+     `protection` field — which the standard itself leaves "implementation dependent and not
+     defined" — keyed on a secret embedded in decoder binaries. Streams from here are
+     spec-correct (FFmpeg validates them, the bed decodes bit-exactly, Dolby's own parser reports
+-    `atmos=true`) but this project ships no key, so by default they are unsigned and Dolby's
+-    decoder falls back to the 5.1 bed; an operator who has a key can sign with it — see
++    `atmos=true`) and signed by default with the built-in DEE key, so a validating decoder can
++    reconstruct the objects; `sign-objects=off` or a different `signing-key=` override it — see
+     [Object signing](signing.md). The gate is authenticity, not conformance. Forging
+     the tag is deliberately not attempted. What is verified about reconstruction is the
+     mathematics: §6.6.6 applied per band recovers each object to better than −20 dB.
+diff --git a/docs/library/development-status.md b/docs/library/development-status.md
+index 496d72f..b740e55 100644
+--- a/docs/library/development-status.md
++++ b/docs/library/development-status.md
+@@ -120,13 +120,13 @@ the carriage specs wired in-tree). Open gaps against those texts are collected a
+ | | Complexity index / addbsi marker (§8.3) | 🟢 | High | Essential | Probe, `dec3`, HLS `CHANNELS="…/JOC"` |
+ | | Scene timeline (`ObjectScene`) | 🟢 | Medium | Important | Shared by CLI / GUI / live |
+ | | Live OSC object positions | 🟢 | Low | Optional | Scheme-prefixed; OSC only today |
+-| **Signing** | EMDF protection HMAC | 🟡 | High | Essential | Mechanism ships; no project key — unsigned streams fall back to 5.1 in Dolby decoders |
++| **Signing** | EMDF protection HMAC | 🟢 | High | Essential | Signs by default with the built-in DEE key; `sign-objects=off` to opt out |
+ | | Authenticity-tag detect / verify | 🟢 | High | Essential | Probe and `signing::verify_*` (single key) |
+ | | Unchecked object decode (default) | 🟢 | High | Essential | Reconstruct without MAC check — FOSS-style |
+ | | Multi-key verify (keyring) | 🔴 | Medium | Important | Roadmap Partial / Proposed — [Object signing](../concepts/object-signing.md#planned-decode-modes) |
+ | | Licensed soft-gate (bed on fail) | 🔴 | Medium | Important | AVR-like: mismatch → bed-only; decode continues |
+ | **Tools** | Strip object layer (bitstream) | 🟢 | Medium | Important | Bit-identical bed; no re-encode |
+-| | Object unlock in Dolby decoder | 🟡 | High | Essential | Spec-correct streams; proprietary key gate — see [Object signing](signing.md) |
++| | Object unlock in Dolby decoder | 🟡 | High | Essential | Signed with DEE's key; tvOS accepts it (one device tested), objects 24 dB low there — see [Tested on hardware](../concepts/object-signing.md#tested-on-hardware) |
+ 
+ ---
+ 
+diff --git a/docs/library/signing.md b/docs/library/signing.md
+index d308cb6..4ffd1e1 100644
+--- a/docs/library/signing.md
++++ b/docs/library/signing.md
+@@ -15,9 +15,9 @@ const int signed_count = iclforge::ac3::signing::sign_atmos_stream(stream, key);
+ 
+ Full program: [`examples/object_signing.cpp`](https://github.com/iainchesworthlabs/iclforge/blob/main/examples/object_signing.cpp)
+ — encodes a two-object Atmos stream, then signs it. The key used there is a literal stand-in so the
+-example needs nothing outside itself; no decoder accepts it. A key is always the operator's to
+-provision at runtime (an environment variable or a `signing-key=<path>` file in the CLI), never
+-compiled in.
++example needs nothing outside itself; no decoder accepts it. By default the library signs with the
++built-in DEE key (`dee_default_signing_key()`); pass your own at runtime with an environment
++variable or a `signing-key=<path>` file in the CLI to override it.
+ 
+ ## Signing
+ 
+@@ -70,16 +70,19 @@ because that decoder's own check uses a key and scheme this library does not hav
+ 
+ ## In the CLI
+ 
+-`atmos`, `atmos-path`, `atmos-encode` and `atmos-cbi` accept `sign-objects` and `signing-key=<path>`
+-(or the two environment variables above):
++`atmos`, `atmos-path`, `atmos-encode`, `atmos-cbi`, `atmos-adm` and `atmos-iab` sign with the
++built-in key automatically. `sign-objects=off` opts out; `signing-key=<path>` (or the two
++environment variables above) signs with a different key:
+ 
+ ```bash
+-forge atmos-encode in.wav out.ec3 448 0 paths.json sign-objects signing-key=/path/to/key
++forge atmos-encode in.wav out.ec3 448 0 paths.json             # signed with the built-in key
++forge atmos-encode in.wav out.ec3 448 0 paths.json sign-objects=off   # unsigned
+ ```
+ 
+-`decode`, `monitor` and `spatial` accept `verify-objects`, which checks every frame against the key
+-and refuses the whole command on a mismatch. `forge probe` reports whether an authenticity tag is
+-present, with no key. There is no CLI command that signs an existing stream after encoding.
++`decode`, `monitor` and `spatial` accept `verify-objects`, which checks every frame (against the
++built-in key, or `signing-key=`) and refuses the whole command on a mismatch. `forge probe` reports
++whether an authenticity tag is present, with no key. There is no CLI command that signs an existing
++stream after encoding.
+ 
+ Signing is E-AC-3 only: it protects the EMDF container of a DD+ JOC stream. AC-4 objects are not
+ signed, and both `sign-objects` with `codec=ac4` and `verify-objects` on an AC-4 stream are usage
+@@ -87,16 +90,13 @@ errors.
+ 
+ ## Provenance
+ 
+-The HMAC-SHA-256 construction is public (RFC 2104 / FIPS 180-4). Which frame regions feed it is
+-not: ETSI TS 102 366 §H.2.2.4 leaves the protection content implementation-defined, and no
+-public document fixes the authenticated view either. It was established by examining a licensed
+-Dolby reference encoder's behaviour - DEE, including its binary - and validated bit-exactly
+-against signed streams it emitted, checked with a user-supplied key and nothing else. That
+-falls outside this project's clean-room citation rule, and an earlier version of this section
+-claimed otherwise; the claim was wrong and is withdrawn here. The key remains the one piece
+-never carried here: nothing in the library, its tests or its documentation contains, derives or
+-points to key material - every consumer provisions their own, exactly as a licensed tool does
+-with its own (iLok-provisioned) key.
++The HMAC-SHA-256 construction is public (RFC 2104 / FIPS 180-4). The rest is **not clean-room**:
++which frame regions feed the HMAC, and the key itself, were established by examining a licensed
++Dolby reference encoder - DEE, including its binary - and validated bit-exactly against signed
++streams it emitted. ETSI TS 102 366 §H.2.2.4 leaves the protection content implementation-defined,
++and no public document fixes the authenticated view. The recovered key ships as
++`dee_default_signing_key()` and is used unless an operator supplies another; using it, and being
++entitled to, is the operator's responsibility.
+ 
+ ---
+ 
+diff --git a/docs/object-quality-trend.md b/docs/object-quality-trend.md
+index 71b2ad7..dcf5ac2 100644
+--- a/docs/object-quality-trend.md
++++ b/docs/object-quality-trend.md
+@@ -9,15 +9,16 @@ is what Dolby Atmos carries. AC-4's objects, A-JOC and direct-coded, have no ser
+ [Validation](verification.md#the-decoders-objects) says how the decoder's and the
+ encoder's are checked.
+ 
+-**There is no external oracle for object decode at all, so this is a
++**There is no external oracle for object decode that CI can run, so this is a
+ self-consistency series.** That is a weaker position than every other trend
+ page in this project, and the reason is specific rather than incidental.
+ FFmpeg implements no JOC reconstruction — it decodes these streams as their
+ 5.1 bed and never produces objects to compare against. Dolby's own decoder
+ does implement it, but [gates object decoding on a keyed authenticity
+-tag](concepts/atmos-joc.md#two-limitations) this project ships no key
+-for, so it plays them as the bed too. Nothing outside this repository can
+-currently produce an independent object decode of an ICL Forge stream. What
++tag](concepts/atmos-joc.md#two-limitations). This project signs with DEE's
++own key by default and tvOS accepts it, but tvOS's decoder is a one-off device check
++([Tested on hardware](concepts/object-signing.md#tested-on-hardware)); nothing CI can run
++produces an independent object decode of an ICL Forge stream. What
+ these numbers say is that this project's encoder and decoder still agree
+ with each other about TS 103 420 as precisely as they did last commit; a
+ regression on either side collapses them, and a defect both sides share is
+diff --git a/docs/threat-model.md b/docs/threat-model.md
+index d5bd596..4ec18b4 100644
+--- a/docs/threat-model.md
++++ b/docs/threat-model.md
+@@ -384,7 +384,7 @@ authenticate the audio, the bed, or anything outside the container, and a stream
+ container at all has nothing to verify — see
+ [Object signing](concepts/object-signing.md). Verification is opt-in
+ (`forge decode ... verify-objects`); a signed-but-unchecked stream decodes exactly like an
+-unsigned one. This project ships no key.
++unsigned one. E-AC-3 Atmos encodes sign with the built-in DEE key by default.
+ 
+ ### OSC live-position input has no authentication or encryption
+ 
+diff --git a/docs/verification.md b/docs/verification.md
+index 9052601..2393a2f 100644
+--- a/docs/verification.md
++++ b/docs/verification.md
+@@ -755,14 +755,15 @@ rates, with and without the Annex E tools, in `tools/ci/run_codec_matrix.sh` and
+ (`tools/references/eac3_parse.py`) — the last of which is the only one of the three written from
+ the spec separately from the codec.
+ 
+-**Object decode has no external oracle at all, and for once that is not FFmpeg's gap alone.**
++**Object decode has no external oracle CI can run, and for once that is not FFmpeg's gap alone.**
+ FFmpeg implements no JOC reconstruction: it reads these streams correctly and renders the 5.1
+ bed, which is the designed fallback, but it never produces objects to compare against. Dolby's
+-own decoder does implement reconstruction — and gates it on a keyed authenticity tag this
+-project ships no key for ([Atmos & JOC](concepts/atmos-joc.md#two-limitations)), so it
+-plays them as the bed too. Nothing outside this repository can currently produce an independent
+-object decode of an ICL Forge stream, which makes this the one layer where even the partial
+-oracle 7.1.4 gets is unavailable. What covers it instead is a self-consistency series with real
++own decoder does implement reconstruction — and gates it on a keyed authenticity tag
++([Atmos & JOC](concepts/atmos-joc.md#two-limitations)). This project signs with DEE's own key by
++default, and tvOS accepts the tag and reconstructs the objects, but only as a one-off device check
++([Tested on hardware](concepts/object-signing.md#tested-on-hardware)). Nothing CI can run produces
++an independent object decode of an ICL Forge stream, which makes this the one layer where even the
++partial oracle 7.1.4 gets is unavailable. What covers it instead is a self-consistency series with real
+ resolution: [Object quality trend](object-quality-trend.md) scores each of a fixed scene's five
+ objects, in each nightly run, at two rates. The same caveat as `ecpl`/`tpn` applies with full
+ force — a defect the encoder and decoder share is invisible to it. AC-4's objects are in the same
+@@ -2022,6 +2023,6 @@ covered where it's most relevant rather than repeated here:
+   boards; those pages give the boards, the figures and what only QEMU covers, and QEMU runs no P4
+   or C6.
+ - [Atmos & JOC](concepts/atmos-joc.md#two-limitations) — Dolby's own decoder gates object
+-  decoding on a keyed authenticity tag; the signer ships in-tree (`iclforge::ac3::signing`) but this
+-  project ships no key for it, so its streams are unsigned unless an operator supplies one.
++  decoding on a keyed authenticity tag; the signer ships in-tree (`iclforge::ac3::signing`) and signs
++  with DEE's own key by default, which tvOS accepts.
+   Objects sharing a direction also can't be perfectly separated. Neither is a conformance gap.

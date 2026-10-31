@@ -1,0 +1,109 @@
+JOC: write the clip gain as DEE does (joc_clipgain_x_bits 4).
+
+The encoder wrote joc_clipgain_x_bits 0 with y 0, which this project's
+decoder reads as unity. tvOS 27.0 applies 2^(x-4) to the reconstructed
+objects, so an Apple TV played every object at exactly 1/16 (-24 dB). DEE
+always writes x=4, y=0, which is unity under either reading; with it, tvOS's
+object levels match this project's own decode within 0.2 dB. Not part of the
+seal. Updates the header test, adds a round-trip check, and notes the
+observation where the decoder's clip-gain reading is documented. Apply after
+05-signing-docs.
+
+---
+
+diff --git a/docs/concepts/object-signing.md b/docs/concepts/object-signing.md
+index dcf1eb4..a2ad357 100644
+--- a/docs/concepts/object-signing.md
++++ b/docs/concepts/object-signing.md
+@@ -55,9 +55,9 @@ to read each output channel's level.
+ - **One primary-tag bit flipped per frame**, with `crc2` re-stamped and nothing else changed:
+   tvOS outputs silence, in playback and in the in-process decode alike. It mutes the stream
+   rather than falling back to the bed.
+-- **Level:** this encoder writes `joc_clipgain_x_bits` as 0, which this project's decoder reads as
+-  unity but tvOS applies as exactly 1/16 (-24 dB) to the reconstructed objects. DEE writes 4; with
+-  4, tvOS's object levels matched this project's own decode within 0.2 dB.
++- **Level:** this encoder writes `joc_clipgain_x_bits` as 4, as DEE does, and tvOS's object levels
++  match this project's own decode within 0.2 dB. With the 0 it used to write, which this project's
++  decoder reads as unity, tvOS scaled the reconstructed objects by exactly 1/16 (-24 dB).
+ 
+ Only this device and OS were tested; other certified decoders may gate differently.
+ 
+diff --git a/docs/library/decoding.md b/docs/library/decoding.md
+index aa25f4c..1b4fdac 100644
+--- a/docs/library/decoding.md
++++ b/docs/library/decoding.md
+@@ -630,6 +630,11 @@ once in `reconstruct()`'s own dispatcher, on the per-object PCM it gets back fro
+ function it calls — every caller already passes `FrameParameters` through unchanged, so one
+ post-multiply there covers all of them with no duplication.
+ 
++One observation does not fit at `x` ≠ 4: tvOS 27.0 played objects coded with `x` = 0, `y` = 0 at
++exactly 1/16 (-24 dB), where this reading gives 1 and `(1 + y/32) * 2^(x-4)` gives 1/16. The
++encoder writes `x` = 4, as DEE does, where both readings are unity
++([Object signing](../concepts/object-signing.md#tested-on-hardware)).
++
+ Separately, and permanently rather than as a gap: Table 47's two "90 degree phase shift" downmix
+ configurations reconstruct like their unshifted siblings — the shift is a property of how the
+ downmix was *built*, §6.6.6 says nothing about undoing it before matrixing, and there is no
+diff --git a/docs/library/development-status.md b/docs/library/development-status.md
+index b740e55..a9de887 100644
+--- a/docs/library/development-status.md
++++ b/docs/library/development-status.md
+@@ -126,7 +126,7 @@ the carriage specs wired in-tree). Open gaps against those texts are collected a
+ | | Multi-key verify (keyring) | 🔴 | Medium | Important | Roadmap Partial / Proposed — [Object signing](../concepts/object-signing.md#planned-decode-modes) |
+ | | Licensed soft-gate (bed on fail) | 🔴 | Medium | Important | AVR-like: mismatch → bed-only; decode continues |
+ | **Tools** | Strip object layer (bitstream) | 🟢 | Medium | Important | Bit-identical bed; no re-encode |
+-| | Object unlock in Dolby decoder | 🟡 | High | Essential | Signed with DEE's key; tvOS accepts it (one device tested), objects 24 dB low there — see [Tested on hardware](../concepts/object-signing.md#tested-on-hardware) |
++| | Object unlock in Dolby decoder | 🟡 | High | Essential | Signed with DEE's key; tvOS accepts it (one device tested) — see [Tested on hardware](../concepts/object-signing.md#tested-on-hardware) |
+ 
+ ---
+ 
+diff --git a/libs/ac3/src/oba/joc.cpp b/libs/ac3/src/oba/joc.cpp
+index 7fbe0e4..df4a334 100644
+--- a/libs/ac3/src/oba/joc.cpp
++++ b/libs/ac3/src/oba/joc.cpp
+@@ -102,10 +102,11 @@ std::vector<std::byte> build_payload(const FrameParameters& params) {
+     w.put(0, 3);  // joc_ext_config_idx: no extensional configuration data
+ 
+     // --- joc_info (§6.2.3) ---
+-    // §6.3.3.2: joc_clipgain = 1 + (y/32) * 2^(x-4) (see parse_payload for
+-    // how that reading was pinned down) is 1 for y=0 regardless of x. This
+-    // encoder applies no clip protection, so unity is the honest value.
+-    w.put(0, 3);  // joc_clipgain_x_bits
++    // This encoder applies no clip protection, so it signals unity: x=4, y=0,
++    // as DEE writes it. parse_payload's reading of §6.3.3.2 makes y=0 unity
++    // for any x, but tvOS 27.0 scales the reconstructed objects by 2^(x-4)
++    // and played x=0 at exactly 1/16 (-24 dB). x=4 is unity either way.
++    w.put(4, 3);  // joc_clipgain_x_bits
+     w.put(0, 5);  // joc_clipgain_y_bits
+     w.put(static_cast<std::uint32_t>(params.seq_count), 10);
+ 
+@@ -198,6 +199,8 @@ std::optional<FrameParameters> parse_payload(std::span<const std::byte> payload)
+     // unscaled bed decode to bit-exact correlation (1.0000) regardless of
+     // clip gain - i.e. the gain is applied to reconstructed OBJECT PCM only,
+     // never to the bed. See docs/library/decoding.md for the full writeup.
++    // One observation does not fit at x != 4: tvOS 27.0 played x=0, y=0 at
++    // exactly 1/16, where this reading gives 1 (build_payload writes x=4).
+     // Applied ONCE in reconstruct()'s own dispatcher, on the per-object PCM
+     // it gets back from whichever of reconstruct_qmf/reconstruct_mdct_band it
+     // calls - both of reconstruct()'s callers (decode_substream_core and, for
+diff --git a/libs/ac3/tests/oba/test_oba.cpp b/libs/ac3/tests/oba/test_oba.cpp
+index b64235b..e0372ae 100644
+--- a/libs/ac3/tests/oba/test_oba.cpp
++++ b/libs/ac3/tests/oba/test_oba.cpp
+@@ -131,7 +131,7 @@ TEST_CASE("JOC payload decodes back to the matrix it was given", "[oba][joc]") {
+     CHECK(r.read(3) == 0);  // joc_ext_config_idx
+ 
+     // --- joc_info ---
+-    CHECK(r.read(3) == 0);   // joc_clipgain_x_bits
++    CHECK(r.read(3) == 4);   // joc_clipgain_x_bits: DEE's value; 0 plays at 1/16 on tvOS
+     CHECK(r.read(5) == 0);   // joc_clipgain_y_bits
+     CHECK(r.read(10) == 7);  // joc_seq_count_bits
+     for (int object = 0; object < params.objects; ++object) {
+@@ -436,6 +436,7 @@ TEST_CASE("JOC parse_payload decodes back to the matrix it was given", "[oba][jo
+         CHECK(decoded->num_bands_idx == params.num_bands_idx);
+         CHECK(decoded->fine_quant == params.fine_quant);
+         CHECK(decoded->seq_count == params.seq_count);
++        CHECK(decoded->clip_gain == 1.0);
+         REQUIRE(decoded->matrix.size() == params.matrix.size());
+         for (int object = 0; object < params.objects; ++object) {
+             for (int channel = 0; channel < params.channels; ++channel) {

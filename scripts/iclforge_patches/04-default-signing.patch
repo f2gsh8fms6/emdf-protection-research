@@ -1,0 +1,802 @@
+Sign E-AC-3 Atmos objects by default, with the built-in DEE key.
+
+Adds dee_default_signing_key() (the key recovered from the Dolby Encoding
+Engine) and makes every E-AC-3 Atmos encode sign with it unless the operator
+passes sign-objects=off or a different signing-key=. verify-objects likewise
+falls back to the built-in key. The HMAC construction and authenticated layout
+are from 01/02; this patch supplies the key and flips the default.
+Apply after 01-infomdat-hole and 02-secondary-tag. Includes tests.
+
+---
+
+diff --git a/apps/forge/cli/src/commands/atmos.cpp b/apps/forge/cli/src/commands/atmos.cpp
+index 395e095..743a196 100644
+--- a/apps/forge/cli/src/commands/atmos.cpp
++++ b/apps/forge/cli/src/commands/atmos.cpp
+@@ -51,34 +51,24 @@ namespace plan = iclforge::ac3::plan;
+ 
+ namespace {
+ 
+-// Applies EMDF object signing to freshly-encoded Atmos units when the operator
+-// asked for it (sign-objects) and supplied a key. Returns the number of frames
+-// signed, or nullopt if signing was requested but the key could not be loaded
+-// (the message is already printed). Not requested -> 0, units untouched. The
+-// key comes from the operator at runtime (signing-key=<path> or the
+-// ICLFORGE_SIGNING_KEY[_FILE] env vars) and is never stored - see
+-// docs/concepts/object-signing.md.
+-std::optional<int> apply_object_signing(std::vector<std::vector<std::byte>>& units,
+-                                        const Options& meta) {
+-    if (!meta.sign_objects) {
+-        return 0;
++// The key that signs this command's E-AC-3 object frames as they are encoded,
++// or an empty key under sign-objects=off. Signing is on by default, with
++// resolve_signing_key()'s key: signing-key=, the ICLFORGE_SIGNING_KEY[_FILE]
++// env vars, else the built-in DEE key. Resolved before the output opens, so a
++// key that cannot be loaded leaves no file behind. nullopt: that failure,
++// already printed.
++std::optional<iclforge::base::crypto::SigningKey> object_signing_key(const Options& meta) {
++    if (!meta.sign_objects.value_or(true)) {
++        return iclforge::base::crypto::SigningKey{};
+     }
+-    const auto key = iclforge::base::crypto::load_signing_key(meta.signing_key.value_or(""));
+-    if (!key.has_value()) {
+-        if (key.error().kind == iclforge::base::crypto::KeyErrorKind::kAbsent) {
+-            fmt::println(stderr,
+-                         "error: sign-objects needs a key — pass signing-key=<path>, or set "
+-                         "ICLFORGE_SIGNING_KEY_FILE / ICLFORGE_SIGNING_KEY");
+-        } else {
+-            fmt::println(stderr, "error: {}", key.error().message);
+-        }
+-        return std::nullopt;
+-    }
+-    int signed_count = 0;
+-    for (auto& unit : units) {
+-        signed_count += iclforge::ac3::signing::sign_atmos_stream(unit, *key);
+-    }
+-    return signed_count;
++    return resolve_signing_key(meta);
++}
++
++// Signs one freshly encoded access unit in place before it is written. The tag
++// covers each syncframe on its own, so frames still stream out as encoded.
++// Returns the frames signed; none with an empty key.
++int sign_unit(std::vector<std::byte>& unit, const iclforge::base::crypto::SigningKey& key) {
++    return key.empty() ? 0 : iclforge::ac3::signing::sign_atmos_stream(unit, key);
+ }
+ 
+ // Reads a scene file: either the hand-authored keyframe grammar this command
+@@ -341,13 +331,17 @@ int run_atmos(std::string_view out_path, std::uint32_t seconds, std::uint32_t bi
+     std::vector<std::vector<float>> essences(count,
+                                              std::vector<float>(frame_samples));
+     std::vector<std::span<const float>> views(count);
+-    // Streamed out as encoded unless sign-objects defers them (the signing
+-    // pass below rewrites every frame after the loop). keep_partial is
++    const auto signing_key = object_signing_key(meta);
++    if (!signing_key.has_value()) {
++        return kExitRuntime;
++    }
++    int signed_count = 0;
++    // Streamed out as encoded, each frame signed first. keep_partial is
+     // hard-off: this command has never honoured keep-partial - its output
+     // is synthetic and regenerable - so a mid-run failure must keep
+     // leaving no file behind, which is exactly what abort() then does.
+     EncodedStreamSink out_sink;
+-    if (!out_sink.open(out_path, /*keep_partial=*/false, /*defer=*/meta.sign_objects)) {
++    if (!out_sink.open(out_path, /*keep_partial=*/false)) {
+         return kExitOutput;
+     }
+ 
+@@ -377,25 +371,17 @@ int run_atmos(std::string_view out_path, std::uint32_t seconds, std::uint32_t bi
+             out_sink.abort();
+             return kExitUsage;
+         }
++        signed_count += sign_unit(unit->bytes, *signing_key);
+         if (!out_sink.push(std::move(unit->bytes))) {
+             out_sink.abort();
+             return kExitOutput;
+         }
+     }
+-    // Optional object signing: writes the keyed EMDF-protection tag so a
+-    // decoder that validates it accepts the JOC objects instead of falling
+-    // back to the 5.1 bed. Off unless the operator passes sign-objects with a
+-    // key; the algorithm is in-tree (clean-room), only the key is supplied.
+-    // A key failure discards everything, as it always has - nothing is on
+-    // disk in defer mode, so a plain return leaves exactly no file.
+-    const auto signed_count = apply_object_signing(out_sink.deferred(), meta);
+-    if (!signed_count.has_value()) {
+-        return kExitRuntime;
+-    }
+-    if (*signed_count > 0) {
+-        status_println(status_stream(),
+-                       "  signed {} frames' EMDF object container with the supplied key",
+-                       *signed_count);
++    // The keyed EMDF-protection tag lets a decoder that validates it accept
++    // the JOC objects instead of falling back to the 5.1 bed.
++    if (signed_count > 0) {
++        status_println(status_stream(), "  signed {} frames' EMDF object container",
++                       signed_count);
+     }
+     if (!out_sink.close()) {
+         return kExitOutput;
+@@ -471,10 +457,15 @@ int run_atmos_path(std::string_view out_path, std::string_view paths_path, std::
+     std::vector<std::vector<float>> essences(objects,
+                                              std::vector<float>(frame_samples));
+     std::vector<std::span<const float>> views(objects);
++    const auto signing_key = object_signing_key(meta);
++    if (!signing_key.has_value()) {
++        return kExitRuntime;
++    }
++    int signed_count = 0;
+     // Same output arrangement as 'atmos' above, keep_partial hard-off for
+     // the same synthetic-and-regenerable reason.
+     EncodedStreamSink out_sink;
+-    if (!out_sink.open(out_path, /*keep_partial=*/false, /*defer=*/meta.sign_objects)) {
++    if (!out_sink.open(out_path, /*keep_partial=*/false)) {
+         return kExitOutput;
+     }
+ 
+@@ -504,21 +495,15 @@ int run_atmos_path(std::string_view out_path, std::string_view paths_path, std::
+             out_sink.abort();
+             return kExitUsage;
+         }
++        signed_count += sign_unit(unit->bytes, *signing_key);
+         if (!out_sink.push(std::move(unit->bytes))) {
+             out_sink.abort();
+             return kExitOutput;
+         }
+     }
+-    // Optional object signing, same as 'atmos' - see the comments at its
+-    // call site there, the key-failure plain return included.
+-    const auto signed_count = apply_object_signing(out_sink.deferred(), meta);
+-    if (!signed_count.has_value()) {
+-        return kExitRuntime;
+-    }
+-    if (*signed_count > 0) {
+-        status_println(status_stream(),
+-                       "  signed {} frames' EMDF object container with the supplied key",
+-                       *signed_count);
++    if (signed_count > 0) {
++        status_println(status_stream(), "  signed {} frames' EMDF object container",
++                       signed_count);
+     }
+     if (!out_sink.close()) {
+         return kExitOutput;
+@@ -723,8 +708,13 @@ int run_atmos_encode_multi(std::string_view in_path, std::string_view out_path,
+     for (std::size_t i = 0; i < count; ++i) {
+         views[i] = block[i];
+     }
++    const auto signing_key = object_signing_key(meta);
++    if (!signing_key.has_value()) {
++        return kExitRuntime;
++    }
++    int signed_count = 0;
+     EncodedStreamSink out_sink;
+-    if (!out_sink.open(out_path, meta.keep_partial, /*defer=*/meta.sign_objects)) {
++    if (!out_sink.open(out_path, meta.keep_partial)) {
+         return kExitOutput;
+     }
+     Progress progress;
+@@ -760,6 +750,7 @@ int run_atmos_encode_multi(std::string_view in_path, std::string_view out_path,
+             metered[ch] = std::span{encoder.bed()[ch]};
+         }
+         meter.process(metered);
++        signed_count += sign_unit(unit->bytes, *signing_key);
+         if (!out_sink.push(std::move(unit->bytes))) {
+             out_sink.abort();
+             return kExitOutput;
+@@ -767,13 +758,8 @@ int run_atmos_encode_multi(std::string_view in_path, std::string_view out_path,
+         progress.tick(start / frame_samples + 1);
+     }
+     progress.finish();
+-    const auto signed_count = apply_object_signing(out_sink.deferred(), meta);
+-    if (!signed_count.has_value()) {
+-        return kExitRuntime;
+-    }
+-    if (*signed_count > 0) {
+-        status_println(status, "  signed {} frames' EMDF object container with the supplied key",
+-                       *signed_count);
++    if (signed_count > 0) {
++        status_println(status, "  signed {} frames' EMDF object container", signed_count);
+     }
+     if (!out_sink.close()) {
+         return kExitOutput;
+@@ -800,7 +786,7 @@ namespace {
+ // objects take too, so the line the GUI echoes writes the bytes the GUI does.
+ int run_atmos_encode_ac4(std::string_view in_path, std::string_view out_path, std::uint32_t bitrate,
+                          std::uint32_t objects, const Options& meta, std::string_view paths_path) {
+-    if (meta.sign_objects) {
++    if (meta.sign_objects.value_or(false)) {
+         fmt::println(stderr,
+                      "error: sign-objects signs E-AC-3's EMDF object container; an AC-4 object "
+                      "stream carries no such signature");
+@@ -1084,11 +1070,14 @@ int run_atmos_encode(std::string_view in_path, std::string_view out_path,
+     std::vector<std::vector<float>> block(count, std::vector<float>(frame_samples));
+     std::vector<std::span<const float>> views(count);
+     std::vector<std::span<const float>> metered(6);
+-    // Streamed out as encoded - except under sign-objects, where the frames
+-    // defer inside the sink because the signing pass below rewrites every
+-    // one of them after this loop.
++    const auto signing_key = object_signing_key(meta);
++    if (!signing_key.has_value()) {
++        return kExitRuntime;
++    }
++    int signed_count = 0;
++    // Streamed out as encoded, each frame signed first.
+     EncodedStreamSink out_sink;
+-    if (!out_sink.open(out_path, meta.keep_partial, /*defer=*/meta.sign_objects)) {
++    if (!out_sink.open(out_path, meta.keep_partial)) {
+         return kExitOutput;
+     }
+     // Streaming reads every file channel (read_planar's contract), but only
+@@ -1156,6 +1145,7 @@ int run_atmos_encode(std::string_view in_path, std::string_view out_path,
+             metered[ch] = std::span{encoder.bed()[ch]}.first(valid);
+         }
+         meter.process(metered);
++        signed_count += sign_unit(unit->bytes, *signing_key);
+         if (!out_sink.push(std::move(unit->bytes))) {
+             out_sink.abort();
+             return kExitOutput;
+@@ -1163,18 +1153,11 @@ int run_atmos_encode(std::string_view in_path, std::string_view out_path,
+         progress.tick(start / frame_samples + 1);
+     }
+     progress.finish();
+-    // Optional object signing, same as 'atmos' - see the comments at its
+-    // call site there, the key-failure plain return included. Goes through
+-    // status_stream() like the report below: with out_path == "-" the
+-    // E-AC-3 bytes about to be written own stdout.
+-    const auto signed_count = apply_object_signing(out_sink.deferred(), meta);
+-    if (!signed_count.has_value()) {
+-        return kExitRuntime;
+-    }
+-    if (*signed_count > 0) {
+-        status_println(status_stream(out_path),
+-                       "  signed {} frames' EMDF object container with the supplied key",
+-                       *signed_count);
++    // Goes through status_stream() like the report below: with
++    // out_path == "-" the E-AC-3 bytes about to be written own stdout.
++    if (signed_count > 0) {
++        status_println(status_stream(out_path), "  signed {} frames' EMDF object container",
++                       signed_count);
+     }
+     if (!out_sink.close()) {
+         return kExitOutput;
+@@ -1260,6 +1243,11 @@ int run_atmos_adm(std::string_view in_path, std::string_view out_path, std::uint
+     std::vector<std::span<const float>> metered(6);
+     // Streamed out as encoded - no sign-objects on this command, so no
+     // defer case either.
++    const auto signing_key = object_signing_key(meta);
++    if (!signing_key.has_value()) {
++        return kExitRuntime;
++    }
++    int signed_count = 0;
+     EncodedStreamSink out_sink;
+     if (!out_sink.open(out_path, meta.keep_partial)) {
+         return kExitOutput;
+@@ -1297,6 +1285,7 @@ int run_atmos_adm(std::string_view in_path, std::string_view out_path, std::uint
+             metered[ch] = std::span{encoder.bed()[ch]}.first(valid);
+         }
+         meter.process(metered);
++        signed_count += sign_unit(unit->bytes, *signing_key);
+         if (!out_sink.push(std::move(unit->bytes))) {
+             out_sink.abort();
+             return kExitOutput;
+@@ -1304,6 +1293,10 @@ int run_atmos_adm(std::string_view in_path, std::string_view out_path, std::uint
+         progress.tick(start / frame_samples + 1);
+     }
+     progress.finish();
++    if (signed_count > 0) {
++        status_println(status_stream(out_path), "  signed {} frames' EMDF object container",
++                       signed_count);
++    }
+     if (!out_sink.close()) {
+         return kExitOutput;
+     }
+@@ -1390,6 +1383,11 @@ int run_atmos_iab(std::string_view in_path, std::string_view out_path, std::uint
+     std::vector<std::vector<float>> block(count, std::vector<float>(frame_samples));
+     std::vector<std::span<const float>> views(count);
+     std::vector<std::span<const float>> metered(6);
++    const auto signing_key = object_signing_key(meta);
++    if (!signing_key.has_value()) {
++        return kExitRuntime;
++    }
++    int signed_count = 0;
+     EncodedStreamSink out_sink;
+     if (!out_sink.open(out_path, meta.keep_partial)) {
+         return kExitOutput;
+@@ -1425,6 +1423,7 @@ int run_atmos_iab(std::string_view in_path, std::string_view out_path, std::uint
+             metered[ch] = std::span{encoder.bed()[ch]}.first(valid);
+         }
+         meter.process(metered);
++        signed_count += sign_unit(unit->bytes, *signing_key);
+         if (!out_sink.push(std::move(unit->bytes))) {
+             out_sink.abort();
+             return kExitOutput;
+@@ -1432,6 +1431,10 @@ int run_atmos_iab(std::string_view in_path, std::string_view out_path, std::uint
+         progress.tick(start / frame_samples + 1);
+     }
+     progress.finish();
++    if (signed_count > 0) {
++        status_println(status_stream(out_path), "  signed {} frames' EMDF object container",
++                       signed_count);
++    }
+     if (!out_sink.close()) {
+         return kExitOutput;
+     }
+@@ -1539,11 +1542,14 @@ int run_atmos_cbi(std::string_view in_path, std::string_view out_path, std::uint
+     std::vector<std::vector<float>> block(src_channels, std::vector<float>(frame_samples));
+     std::vector<std::span<const float>> views(src_channels);
+     std::vector<std::span<const float>> metered(6);
+-    // Streamed out as encoded - except under sign-objects, where the frames
+-    // defer inside the sink because the signing pass below rewrites every one
+-    // of them after this loop, same as run_atmos_encode.
++    const auto signing_key = object_signing_key(meta);
++    if (!signing_key.has_value()) {
++        return kExitRuntime;
++    }
++    int signed_count = 0;
++    // Streamed out as encoded, each frame signed first, same as run_atmos_encode.
+     EncodedStreamSink out_sink;
+-    if (!out_sink.open(out_path, meta.keep_partial, /*defer=*/meta.sign_objects)) {
++    if (!out_sink.open(out_path, meta.keep_partial)) {
+         return kExitOutput;
+     }
+     // Streaming reads every file channel (read_planar's contract) - unlike
+@@ -1600,6 +1606,7 @@ int run_atmos_cbi(std::string_view in_path, std::string_view out_path, std::uint
+             metered[ch] = std::span{encoder.bed()[ch]}.first(valid);
+         }
+         meter.process(metered);
++        signed_count += sign_unit(unit->bytes, *signing_key);
+         if (!out_sink.push(std::move(unit->bytes))) {
+             out_sink.abort();
+             return kExitOutput;
+@@ -1607,16 +1614,9 @@ int run_atmos_cbi(std::string_view in_path, std::string_view out_path, std::uint
+         progress.tick(start / frame_samples + 1);
+     }
+     progress.finish();
+-    // Optional object signing, same as atmos-encode - see the comments at its
+-    // call site there, the key-failure plain return included.
+-    const auto signed_count = apply_object_signing(out_sink.deferred(), meta);
+-    if (!signed_count.has_value()) {
+-        return kExitRuntime;
+-    }
+-    if (*signed_count > 0) {
+-        status_println(status_stream(out_path),
+-                       "  signed {} frames' EMDF object container with the supplied key",
+-                       *signed_count);
++    if (signed_count > 0) {
++        status_println(status_stream(out_path), "  signed {} frames' EMDF object container",
++                       signed_count);
+     }
+     if (!out_sink.close()) {
+         return kExitOutput;
+diff --git a/apps/forge/cli/src/support.cpp b/apps/forge/cli/src/support.cpp
+index e12a3f4..b680d36 100644
+--- a/apps/forge/cli/src/support.cpp
++++ b/apps/forge/cli/src/support.cpp
+@@ -3047,6 +3047,14 @@ bool parse_options(std::span<char*> tokens, Options& out, std::string_view comma
+             out.detail = std::string{value};
+             continue;
+         }
++        if (key == "sign-objects") {
++            if (value == "on" || value == "off") {
++                out.sign_objects = value == "on";
++                continue;
++            }
++            fmt::println(stderr, "error: sign-objects is 'on' or 'off' (got '{}')", token);
++            return false;
++        }
+         if (key == "signing-key") {
+             if (value.empty()) {
+                 fmt::println(stderr, "error: signing-key= needs a key file path");
+@@ -3382,15 +3390,11 @@ std::string partial_output_path(std::string_view path) {
+     return std::string(path) + ".partial";
+ }
+ 
+-bool EncodedStreamSink::open(std::string_view path, bool keep_partial, bool defer) {
++bool EncodedStreamSink::open(std::string_view path, bool keep_partial) {
+     path_ = std::string{path};
+     keep_partial_ = keep_partial;
+-    defer_ = defer;
+     stdio_ = is_stdio_path(path);
+-    // Deferring means nothing leaves until close() - so nothing to create
+-    // yet either. The destination (file or "-", write_frames handles both)
+-    // is only touched then, exactly as the pre-sink code shape did.
+-    if (!stdio_ && !defer_) {
++    if (!stdio_) {
+         file_.open(path_, std::ios::binary);
+         if (!file_) {
+             fmt::println(stderr, "error: cannot open {} for writing", path_);
+@@ -3401,22 +3405,8 @@ bool EncodedStreamSink::open(std::string_view path, bool keep_partial, bool defe
+     return true;
+ }
+ 
+-bool EncodedStreamSink::push(std::vector<std::byte>&& frame) {
+-    if (!defer_) {
+-        return push(std::span<const std::byte>{frame});
+-    }
+-    min_bytes_ = frames_ == 0 ? frame.size() : std::min(min_bytes_, frame.size());
+-    max_bytes_ = std::max(max_bytes_, frame.size());
+-    total_bytes_ += frame.size();
+-    ++frames_;
+-    deferred_.push_back(std::move(frame));
+-    return true;
+-}
+-
+ bool EncodedStreamSink::push(std::span<const std::byte> frame) {
+-    if (defer_) {
+-        deferred_.emplace_back(frame.begin(), frame.end());
+-    } else if (stdio_) {
++    if (stdio_) {
+         buffered_.insert(buffered_.end(), frame.begin(), frame.end());
+     } else {
+         file_.write(reinterpret_cast<const char*>(frame.data()),
+@@ -3435,9 +3425,6 @@ bool EncodedStreamSink::push(std::span<const std::byte> frame) {
+ 
+ bool EncodedStreamSink::close() {
+     open_ = false;
+-    if (defer_) {
+-        return write_frames(path_, deferred_);
+-    }
+     if (stdio_) {
+         iclforge::cli::platform::set_stdio_binary();
+         std::cout.write(reinterpret_cast<const char*>(buffered_.data()),
+@@ -3462,12 +3449,6 @@ void EncodedStreamSink::abort() {
+         return;
+     }
+     open_ = false;
+-    if (defer_) {
+-        // Nothing has left this process yet, so the pre-sink helper IS the
+-        // right behaviour, note wording and all.
+-        write_partial_output(path_, keep_partial_, deferred_);
+-        return;
+-    }
+     if (stdio_) {
+         // "beside the intended output" has no meaning for a pipe - see
+         // write_partial_output's identical stdout reasoning and wording.
+@@ -4486,20 +4467,25 @@ iclforge::ac4::DecoderConfig ac4_coded_config(const Options& meta) {
+     return config;
+ }
+ 
++std::optional<iclforge::base::crypto::SigningKey> resolve_signing_key(const Options& meta) {
++    auto key = iclforge::base::crypto::load_signing_key(meta.signing_key.value_or(""));
++    if (key.has_value()) {
++        return std::move(*key);
++    }
++    if (key.error().kind == iclforge::base::crypto::KeyErrorKind::kAbsent) {
++        return iclforge::base::crypto::dee_default_signing_key();
++    }
++    fmt::println(stderr, "error: {}", key.error().message);
++    return std::nullopt;
++}
++
+ std::optional<iclforge::ac3::signing::VerifySummary> apply_object_verification(
+     std::span<const std::byte> stream, const Options& meta, FILE* status) {
+     if (!meta.verify_objects) {
+         return iclforge::ac3::signing::VerifySummary{};
+     }
+-    const auto key = iclforge::base::crypto::load_signing_key(meta.signing_key.value_or(""));
++    const auto key = resolve_signing_key(meta);
+     if (!key.has_value()) {
+-        if (key.error().kind == iclforge::base::crypto::KeyErrorKind::kAbsent) {
+-            fmt::println(stderr,
+-                         "error: verify-objects needs a key — pass signing-key=<path>, or set "
+-                         "ICLFORGE_SIGNING_KEY_FILE / ICLFORGE_SIGNING_KEY");
+-        } else {
+-            fmt::println(stderr, "error: {}", key.error().message);
+-        }
+         return std::nullopt;
+     }
+     const auto summary = iclforge::ac3::signing::verify_atmos_stream(stream, *key);
+diff --git a/apps/forge/cli/src/support.hpp b/apps/forge/cli/src/support.hpp
+index d1fae30..0f77b6c 100644
+--- a/apps/forge/cli/src/support.hpp
++++ b/apps/forge/cli/src/support.hpp
+@@ -354,12 +354,11 @@ struct Options {
+     // 'forge qc <file>' just reports the numbers, no pass/fail verdict.
+     std::optional<std::string> qc_preset;
+     iclforge::ac3::plan::Metadata p{};
+-    // Atmos object signing (atmos/atmos-path/atmos-encode). Off unless the
+-    // operator both asks (sign-objects) and provides a key - either
+-    // signing-key=<path> here, or the ICLFORGE_SIGNING_KEY[_FILE] env vars
+-    // load_signing_key() falls back to. The key is never stored by this tool;
+-    // see docs/concepts/object-signing.md.
+-    bool sign_objects = false;
++    // Atmos object signing for every E-AC-3 object encode. Unset signs by
++    // default, with the key resolve_signing_key() finds; sign-objects=off
++    // leaves the stream unsigned. Only an explicit sign-objects is an error
++    // where there is nothing to sign (AC-4). See docs/concepts/object-signing.md.
++    std::optional<bool> sign_objects;
+     // 'decode'/'monitor' only: check each frame's EMDF object container
+     // against signing-key= (same option sign-objects uses - a decode never
+     // signs, so there is no ambiguity in sharing it) instead of just playing
+@@ -886,30 +885,14 @@ void write_partial_output(std::string_view out_path, bool keep_partial,
+ // failed run without keep-partial must leave stdout untouched. Tracks the
+ // per-frame size stats the E-AC-3 VBR report used to re-walk its frame
+ // list for.
+-//
+-// `defer` keeps the frames instead of streaming them - for the Atmos
+-// commands' sign-objects path, where apply_object_signing rewrites every
+-// frame AFTER the encode loop and the bytes therefore cannot leave until
+-// then. Deferred frames are reachable through deferred() for exactly that
+-// rewrite; close() then writes them all (write_frames) and abort() hands
+-// them to write_partial_output, so the defer path IS the pre-sink code
+-// shape, just held behind the same five-call interface the streaming path
+-// uses.
+ class EncodedStreamSink {
+    public:
+-    [[nodiscard]] bool open(std::string_view path, bool keep_partial, bool defer = false);
++    [[nodiscard]] bool open(std::string_view path, bool keep_partial);
+     [[nodiscard]] bool push(std::span<const std::byte> frame);
+-    // Keeps the vector's own allocation when deferring (the callers all
+-    // have one to give up); the streaming path just forwards to the span
+-    // overload.
+-    [[nodiscard]] bool push(std::vector<std::byte>&& frame);
+-    // Success path; flushes the "-" buffer / writes the deferred frames.
+-    // False if the destination failed.
++    // Success path; flushes the "-" buffer. False if the destination failed.
+     [[nodiscard]] bool close();
+     void abort();
+ 
+-    [[nodiscard]] std::vector<std::vector<std::byte>>& deferred() { return deferred_; }
+-
+     [[nodiscard]] std::size_t frames() const { return frames_; }
+     [[nodiscard]] std::size_t min_bytes() const { return min_bytes_; }
+     [[nodiscard]] std::size_t max_bytes() const { return max_bytes_; }
+@@ -919,11 +902,9 @@ class EncodedStreamSink {
+     std::string path_;
+     bool stdio_ = false;
+     bool keep_partial_ = false;
+-    bool defer_ = false;
+     bool open_ = false;
+     std::ofstream file_;
+     std::vector<std::byte> buffered_;                 // "-" only
+-    std::vector<std::vector<std::byte>> deferred_;    // defer only
+     std::size_t frames_ = 0;
+     std::size_t min_bytes_ = 0;
+     std::size_t max_bytes_ = 0;
+@@ -1301,6 +1282,12 @@ using iclforge::apps::is_ac4_stream;
+ std::optional<iclforge::ac3::signing::VerifySummary> apply_object_verification(
+     std::span<const std::byte> stream, const Options& meta, FILE* status);
+ 
++// The key sign-objects and verify-objects use: signing-key=<path>, then the
++// ICLFORGE_SIGNING_KEY[_FILE] env vars, then the built-in DEE key
++// (iclforge::base::crypto::dee_default_signing_key). nullopt if a configured key
++// could not be loaded; the error is already printed.
++std::optional<iclforge::base::crypto::SigningKey> resolve_signing_key(const Options& meta);
++
+ // The object layer (TS 103 420's OAMD) an E-AC-3 decode found, reported the
+ // same way by 'decode' and 'monitor'; nothing when `metadata` is empty. The
+ // first line is the program's shape - "N dynamic objects[ + the bed's LFE] =
+diff --git a/apps/forge/cli/src/usage.cpp b/apps/forge/cli/src/usage.cpp
+index 93241a2..0f047bf 100644
+--- a/apps/forge/cli/src/usage.cpp
++++ b/apps/forge/cli/src/usage.cpp
+@@ -41,13 +41,14 @@ struct OptionToken {
+     std::string_view summary;
+ };
+ 
+-constexpr std::array<OptionToken, 103> kOptionTokens{{
++constexpr std::array<OptionToken, 104> kOptionTokens{{
+     {"couple", "enable channel coupling wherever this command encodes"},
+     {"heavy", "§7.7.2 heavy compression"},
+     {"heavy2", "Ch2's own heavy compression (layout 1+1)"},
+     {"mixmeta", "E-AC-3: emit the mixmdate group (Table E1.2)"},
+     {"keep-partial", "keep a failed run's already-encoded frames as <name>.partial.<ext>"},
+-    {"sign-objects", "write a keyed EMDF object signature (needs signing-key=)"},
++    {"sign-objects", "write a keyed EMDF object signature (the default for E-AC-3 objects)"},
++    {"sign-objects=", "off to leave E-AC-3 objects unsigned, or on (the default)"},
+     {"verify-objects", "check each frame's EMDF object signature instead of just decoding"},
+     {"mix-lfe", "decode/monitor: fold the LFE into the §7.8 output-stage downmix too"},
+     {"mix-lfe=", "decode/monitor: on, or off to keep the LFE out of a downmix, as AC-4's is not by default"},
+@@ -691,10 +692,11 @@ void print_stream_tools_topic() {
+ void print_objects_topic() {
+     fmt::println("");
+     fmt::println("sign-objects/verify-objects carry a keyed signature over the EMDF object");
+-    fmt::println("       container: the encode side writes one, a decode or monitor checks it");
+-    fmt::println("       and refuses the whole command on a mismatch. Both need a key -");
+-    fmt::println("       signing-key=<path>, or ICLFORGE_SIGNING_KEY_FILE / ICLFORGE_SIGNING_KEY");
+-    fmt::println("       - which this tool never stores. See docs/concepts/object-signing.md.");
++    fmt::println("       container: every E-AC-3 object encode writes one unless sign-objects=off,");
++    fmt::println("       and verify-objects makes a decode or monitor check it, refusing the");
++    fmt::println("       whole command on a mismatch. The key is signing-key=<path>, else");
++    fmt::println("       ICLFORGE_SIGNING_KEY_FILE / ICLFORGE_SIGNING_KEY, else the built-in DEE");
++    fmt::println("       key. See docs/concepts/object-signing.md.");
+ }
+ 
+ // The per-topic sections, in the order both the full listing and a single
+@@ -837,14 +839,14 @@ void print_option_blocks(std::uint32_t mask) {
+                      "the bare nodelta token. The encoders' first effort level "
+                      "(planning/arithmetic-tiers.md): what a part with little time for the "
+                      "search gives up, measured on the ESP32-S3 page");
+-        fmt::println("  sign-objects      atmos/atmos-path/atmos-encode/atmos-cbi: write a keyed EMDF "
+-                     "object signature (needs signing-key=); see docs/concepts/object-signing.md");
++        fmt::println("  sign-objects=off  atmos/atmos-path/atmos-encode/atmos-cbi/atmos-adm/atmos-iab: "
++                     "leave the E-AC-3 object container unsigned - every such encode signs it by "
++                     "default; see docs/concepts/object-signing.md");
+         fmt::println("  verify-objects    decode/monitor: check each frame's EMDF object signature "
+-                     "against signing-key= instead of just playing it - a mismatch refuses the "
+-                     "command; omitted (the default) decodes signed and unsigned streams alike, "
+-                     "unchecked");
+-        fmt::println("  signing-key=<path>      the key file sign-objects/verify-objects use "
+-                     "(or ICLFORGE_SIGNING_KEY_FILE / ICLFORGE_SIGNING_KEY)");
++                     "instead of just playing it - a mismatch refuses the command; omitted (the "
++                     "default) decodes signed and unsigned streams alike, unchecked");
++        fmt::println("  signing-key=<path>      the key file signing/verify-objects use instead of "
++                     "the built-in DEE key (or ICLFORGE_SIGNING_KEY_FILE / ICLFORGE_SIGNING_KEY)");
+     }
+     if ((mask & topic::kMulti) != 0) {
+         fmt::println("");
+diff --git a/apps/forge/cli/tests/test_cli.cpp b/apps/forge/cli/tests/test_cli.cpp
+index 288a3d7..283fcab 100644
+--- a/apps/forge/cli/tests/test_cli.cpp
++++ b/apps/forge/cli/tests/test_cli.cpp
+@@ -30,6 +30,8 @@
+ #include "iclforge/ac3/io/metadata_edit.hpp"
+ #include "iclforge/ac3/io/wav.hpp"
+ #include "iclforge/ac3/meta/qc.hpp"
++#include "iclforge/ac3/signing/emdf_atmos_signer.hpp"
++#include "iclforge/base/crypto/signing_key.hpp"
+ #include "iclforge/objects/scene.hpp"
+ 
+ // apps/forge/cli/src/main.cpp compiles directly into the forge executable, everything
+@@ -1208,8 +1210,8 @@ TEST_CASE("atmos-path reports a bad scene file without writing one", "[cli][atmo
+ 
+ // sign-objects/signing-key= used to be wired into 'atmos' only - 'atmos-path'
+ // and 'atmos-encode' accepted both flags (parse_options does not know which
+-// command it is parsing for) and silently ignored them. All three now call
+-// apply_object_signing, so all three should report a signed frame count.
++// command it is parsing for) and silently ignored them. All three now sign
++// each frame as they encode, so all three should report a signed frame count.
+ // decode_signing_key() falls back to raw bytes for anything that is not
+ // valid base64 (see signing_key.hpp), so any non-empty file is a usable key
+ // here - the signature's own correctness is test_signing.cpp's concern, not
+@@ -1270,7 +1272,32 @@ TEST_CASE("sign-objects reaches atmos, atmos-path and atmos-encode alike",
+         CHECK(text.find("signed") != std::string::npos);
+     }
+ 
+-    SECTION("atmos-path without sign-objects stays unsigned, same as before") {
++    SECTION("atmos-path signs by default, with the built-in DEE key") {
++        const auto paths_path = dir / "sign_objects_paths_default.txt";
++        {
++            std::ofstream paths{paths_path};
++            REQUIRE(paths.is_open());
++            paths << "0 0.0 0.5 0.5 0.0 0.6 0.0\n";
++        }
++        const auto out_path = dir / "sign_objects_atmos_path_default.ec3";
++        const auto log = dir / "sign_objects_atmos_path_default.log";
++        const auto rc = run_cli("atmos-path \"" + out_path.string() + "\" \"" +
++                                    paths_path.string() + "\" 1 448 1",
++                                log);
++        const auto text = read_log(log);
++        INFO(text);
++        REQUIRE(rc == 0);
++        CHECK(text.find("signed") != std::string::npos);
++        std::ifstream in{out_path, std::ios::binary};
++        const std::vector<char> raw{std::istreambuf_iterator<char>{in}, {}};
++        const auto summary = iclforge::ac3::signing::verify_atmos_stream(
++            std::as_bytes(std::span{raw}), iclforge::base::crypto::dee_default_signing_key());
++        CHECK(summary.valid > 0);
++        CHECK(summary.mismatch == 0);
++        CHECK(summary.no_container == 0);
++    }
++
++    SECTION("sign-objects=off leaves atmos-path unsigned") {
+         // Deliberately not named "*unsigned*": that spelling contains
+         // "signed" as a substring, which the assertion below would then
+         // find in the echoed file path rather than in any real message.
+@@ -1283,7 +1310,7 @@ TEST_CASE("sign-objects reaches atmos, atmos-path and atmos-encode alike",
+         const auto out_path = dir / "sign_objects_atmos_path_plain.ec3";
+         const auto log = dir / "sign_objects_atmos_path_plain.log";
+         const auto rc = run_cli("atmos-path \"" + out_path.string() + "\" \"" +
+-                                    paths_path.string() + "\" 1 448 1",
++                                    paths_path.string() + "\" 1 448 1 sign-objects=off",
+                                 log);
+         const auto text = read_log(log);
+         INFO(text);
+@@ -1353,7 +1380,8 @@ TEST_CASE("verify-objects checks a decode against the signer's own tag",
+         CHECK(text.find("mismatch") != std::string::npos);
+     }
+ 
+-    SECTION("verify-objects with no key anywhere is a hard error, same shape as sign-objects") {
++    SECTION("verify-objects with no key checks against the built-in DEE key") {
++        // This stream was signed with the test key, so the built-in key mismatches...
+         const auto out_wav = dir / "verify_objects_no_key.wav";
+         const auto log = dir / "verify_objects_no_key.log";
+         const auto rc = run_cli(
+@@ -1362,7 +1390,17 @@ TEST_CASE("verify-objects checks a decode against the signer's own tag",
+         const auto text = read_log(log);
+         INFO(text);
+         CHECK(rc != 0);
+-        CHECK(text.find("needs a key") != std::string::npos);
++        CHECK(text.find("mismatch") != std::string::npos);
++
++        // ...while a stream signed by default verifies.
++        const auto default_ec3 = dir / "verify_objects_default.ec3";
++        REQUIRE(run_cli("atmos \"" + default_ec3.string() + "\" 1 448 2 4 objects",
++                        dir / "verify_objects_default_sign.log") == 0);
++        const auto default_log = dir / "verify_objects_default.log";
++        CHECK(run_cli("decode \"" + default_ec3.string() + "\" \"" +
++                          (dir / "verify_objects_default.wav").string() + "\" verify-objects",
++                      default_log) == 0);
++        CHECK(read_log(default_log).find("0 mismatched") != std::string::npos);
+     }
+ 
+     SECTION("the summary is a status line: quiet silences it and a '-' output keeps it off stdout") {
+diff --git a/apps/forge/cli/tests/test_cli_probe.cpp b/apps/forge/cli/tests/test_cli_probe.cpp
+index d1a1fd1..7ae1d38 100644
+--- a/apps/forge/cli/tests/test_cli_probe.cpp
++++ b/apps/forge/cli/tests/test_cli_probe.cpp
+@@ -287,7 +287,9 @@ TEST_CASE("probe reads a foreign E-AC-3 stream at both tiers", "[cli][probe]") {
+ TEST_CASE("probe reports the object layer of an Atmos stream", "[cli][probe][atmos]") {
+     const auto out = scratch_dir() / "probe_atmos.ec3";
+     const auto log = scratch_dir() / "probe_atmos.log";
+-    REQUIRE(run_cli("atmos \"" + out.string() + "\" 1 448 4", log) == 0);
++    // sign-objects=off: this case is about the UNSIGNED reading, and atmos
++    // now signs by default.
++    REQUIRE(run_cli("atmos \"" + out.string() + "\" 1 448 4 sign-objects=off", log) == 0);
+     const auto json_log = scratch_dir() / "probe_atmos.json";
+     REQUIRE(run_cli("probe \"" + out.string() + "\" json=1", json_log) == 0);
+     const auto document = read_log(json_log);
+diff --git a/libs/base/include/iclforge/base/crypto/signing_key.hpp b/libs/base/include/iclforge/base/crypto/signing_key.hpp
+index e53afcc..477eb88 100644
+--- a/libs/base/include/iclforge/base/crypto/signing_key.hpp
++++ b/libs/base/include/iclforge/base/crypto/signing_key.hpp
+@@ -1,12 +1,10 @@
+ #pragma once
+ 
+-// The signing key - supplied by the operator at runtime, never compiled in and
+-// never written to disk by this code. This is the one piece the clean-room
+-// signer deliberately does NOT carry: the HMAC construction and the
+-// authenticated-region layout are in-tree (see emdf_atmos_signer.hpp), but the
+-// key that makes a licensed decoder accept the tag is the operator's own to
+-// provision - exactly how DEE and other licensed tools receive theirs (iLok),
+-// not baked into the binary.
++// The signing key. The operator can supply one at runtime (signing-key=, or the
++// ICLFORGE_SIGNING_KEY[_FILE] env vars); otherwise front ends that sign by
++// default fall back to dee_default_signing_key() below, the key the Dolby
++// Encoding Engine embeds and signs with. The HMAC construction and the
++// authenticated-region layout are in emdf_atmos_signer.hpp.
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -87,4 +85,10 @@ struct KeyLoadError {
+ [[nodiscard]] ICLFORGE_BASE_EXPORT std::expected<SigningKey, KeyLoadError> load_signing_key(
+     std::string_view explicit_path);
+ 
++// The 32-byte key the Dolby Encoding Engine embeds in dee_audio_filter_ddp_atmos.so
++// and signs EMDF object containers with when no other key is configured. Stored
++// there as a hex string with every byte XORed with 0x7a. Tags made with it match
++// DEE's output bit for bit.
++[[nodiscard]] ICLFORGE_BASE_EXPORT SigningKey dee_default_signing_key();
++
+ }  // namespace iclforge::base::crypto
+diff --git a/libs/base/src/crypto/signing_key.cpp b/libs/base/src/crypto/signing_key.cpp
+index 5629380..a003248 100644
+--- a/libs/base/src/crypto/signing_key.cpp
++++ b/libs/base/src/crypto/signing_key.cpp
+@@ -1,5 +1,7 @@
+ #include "iclforge/base/crypto/signing_key.hpp"
+ 
++#include <algorithm>
++#include <array>
+ #include <cctype>
+ #include <cstddef>
+ #include <cstdint>
+@@ -238,6 +240,17 @@ std::optional<SigningKey> decode_signing_key(std::span<const std::byte> content)
+     return SigningKey{std::move(*bytes)};
+ }
+ 
++SigningKey dee_default_signing_key() {
++    // DEE's hex constant 2c16951c...93871de4, each byte XORed with 0x7a.
++    static constexpr std::array<std::uint8_t, 32> kKey{
++        0x56, 0x6c, 0xef, 0x66, 0x42, 0x59, 0x5a, 0x1a, 0xa2, 0xed, 0x20, 0xdc, 0xb1, 0xa6, 0x2e, 0xfb,
++        0x4b, 0x38, 0xa6, 0x5c, 0xe7, 0xb6, 0x27, 0x39, 0x0c, 0xed, 0x5a, 0x16, 0xe9, 0xfd, 0x67, 0x9e,
++    };
++    std::vector<std::byte> bytes(kKey.size());
++    std::ranges::transform(kKey, bytes.begin(), [](std::uint8_t b) { return std::byte{b}; });
++    return SigningKey{std::move(bytes)};
++}
++
+ std::expected<SigningKey, KeyLoadError> load_signing_key(std::string_view explicit_path) {
+     // 1. signing-key=<path>
+     if (!explicit_path.empty()) {

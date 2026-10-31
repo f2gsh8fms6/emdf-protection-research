@@ -1,0 +1,40 @@
+Debug instrumentation for scripts/emdf_tool.py.
+
+With ICLF_BITPOS set, the E-AC-3 decoder prints each audio block's skip-field
+position, block end and the end of the audio data to stderr.
+
+---
+
+diff --git a/libs/ac3/src/decoder/eac3_decoder.cpp b/libs/ac3/src/decoder/eac3_decoder.cpp
+index 7b7c371..3128639 100644
+--- a/libs/ac3/src/decoder/eac3_decoder.cpp
++++ b/libs/ac3/src/decoder/eac3_decoder.cpp
+@@ -1,3 +1,5 @@
++#include <cstdio>
++#include <cstdlib>
+ #include "iclforge/ac3/core/types.hpp"
+ #include "iclforge/ac3/decoder/decoder.hpp"
+ #include "iclforge/ac3/decoder/syntax_trace.hpp"
+@@ -2906,8 +2908,12 @@ std::expected<std::optional<DecodedSubstream>, DecodeError> Eac3Decoder::decode_
+                 syntax->delta_bit_alloc = delta[static_cast<std::size_t>(ch)].deltnseg > 0;
+             }
+         }
++        if (std::getenv("ICLF_BITPOS")) std::fprintf(stderr, "BITPOS cpl blk=%d cplinu=%d\n", blk, frm->cplinu[static_cast<std::size_t>(blk)]);
++        const auto dbg_skip_pos = r.bit_position();
++        if (std::getenv("ICLF_BITPOS") && frm->skipflde) std::fprintf(stderr, "BITPOS skippt blk=%d pos=%zu\n", blk, static_cast<std::size_t>(dbg_skip_pos));
+         if (frm->skipflde && r.read(1) != 0) {  // skiple
+             const auto skipl = r.read(9);
++            if (std::getenv("ICLF_BITPOS")) std::fprintf(stderr, "BITPOS skip blk=%d pos=%zu skipl=%u\n", blk, static_cast<std::size_t>(dbg_skip_pos), static_cast<unsigned>(skipl));
+             if (syntax != nullptr) {
+                 syntax->skip_field = true;
+                 syntax->skip_bytes = static_cast<std::uint16_t>(skipl);
+@@ -3608,7 +3614,9 @@ std::expected<std::optional<DecodedSubstream>, DecodeError> Eac3Decoder::decode_
+         if (r.overflowed()) {
+             return std::unexpected(DecodeError::kTruncated);
+         }
++        if (std::getenv("ICLF_BITPOS") && frm->skipflde) std::fprintf(stderr, "BITPOS block_end blk=%d pos=%zu\n", blk, static_cast<std::size_t>(r.bit_position()));
+     }
++    if (std::getenv("ICLF_BITPOS")) std::fprintf(stderr, "BITPOS audio_end pos=%zu\n", static_cast<std::size_t>(r.bit_position()));
+ 
+     // impl_->config_.skip_reconstruction stops here. Everything above read the wire
+     // - bsi, audfrm, every block's side information and its mantissas - and

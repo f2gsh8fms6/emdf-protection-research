@@ -1,0 +1,233 @@
+Signing writes the secondary protection tag and verification checks it.
+
+sec = HMAC-SHA-256(key, digest1)[:1], where digest1 is the full 32-byte primary
+digest. Previously the signer left the field zero and the verifier ignored it.
+Streams signed without this patch now fail verification on that field.
+Apply after 01-infomdat-hole.patch. Includes tests and docs updates.
+
+---
+
+diff --git a/docs/concepts/object-signing.md b/docs/concepts/object-signing.md
+index 5d81afc..e7b0ba7 100644
+--- a/docs/concepts/object-signing.md
++++ b/docs/concepts/object-signing.md
+@@ -23,7 +23,7 @@ key, reads none from the build, and has no way to obtain or derive one. What it
+ | Part | Where it comes from | In the library? |
+ |---|---|---|
+ | **HMAC-SHA-256** | FIPS 180-4 / RFC 2104, public standards | Yes — `libs/base/src/crypto/`, dependency-free |
+-| **What gets authenticated** — which frame regions feed the HMAC, and where the tag is written | The public container layout this codec already emits (`libs/objects/src/emdf.cpp`, the E-AC-3 syntax, TS 103 420) | Yes — `libs/ac3/src/signing/emdf_atmos_signer.cpp` |
++| **What gets authenticated** — which frame regions feed the HMAC, and where the tag is written | Not in any public document (TS 102 366 §H.2.2.4 leaves the protection content implementation-defined) — established against a licensed reference encoder's signed output; see [Provenance](../library/signing.md#provenance) | Yes — `libs/ac3/src/signing/emdf_atmos_signer.cpp` |
+ | **The key** | You provision it — exactly as a licensed tool (DEE) receives its own via iLok | **No — never** |
+ 
+ A stream signed with a key that does not match a given decoder's simply fails that decoder's check,
+@@ -36,7 +36,10 @@ project or someone building on `iclforge::ac3::signing` elsewhere.
+     **A** is the frame bitstream with its framing/metadata/skip/CRC regions excised and the
+     remainder packed and padded to a 16-bit word. **B** is the EMDF container content with the
+     protection-tag bits zeroed. The tag is written into `protection_bits_primary` and `crc2` is
+-    recomputed. Frames with no object container are left untouched.
++    recomputed. When the container declares a secondary protection field, that field carries the
++    top bits of a second HMAC-SHA-256 over the primary digest itself - the full 32 bytes - and
++    verification checks it alongside the primary. Frames with no object container are left
++    untouched.
+ 
+ ## Verifying a tag this signer wrote
+ 
+diff --git a/docs/library/signing.md b/docs/library/signing.md
+index e065ea1..d308cb6 100644
+--- a/docs/library/signing.md
++++ b/docs/library/signing.md
+@@ -55,7 +55,10 @@ apart.
+ `has_authenticity_tag(frame)` reports whether a syncframe carries a non-zero tag, without a key. A
+ true result says a tag is present, not that it is valid. `verify_atmos_frame(frame, key)` and
+ `verify_atmos_stream(stream, key)` recompute the tag over the same regions the signer authenticates
+-and compare it with what the frame holds, without modifying anything. A frame with no EMDF object
++and compare it with what the frame holds, without modifying anything. Both protection fields the
++container declares are checked: the primary tag, and the secondary field written alongside it
++(the top bits of a second HMAC over the primary digest — see the construction note in
++[Object signing](../concepts/object-signing.md)). A frame with no EMDF object
+ container has nothing to check, so the frame form returns a `VerifyResult` of `kNoContainer`,
+ `kValid` or `kMismatch`, and the stream form returns a `VerifySummary` of `valid`, `mismatch` and
+ `no_container` counts.
+diff --git a/libs/ac3/src/signing/emdf_atmos_signer.cpp b/libs/ac3/src/signing/emdf_atmos_signer.cpp
+index 6aad4ac..4b10030 100644
+--- a/libs/ac3/src/signing/emdf_atmos_signer.cpp
++++ b/libs/ac3/src/signing/emdf_atmos_signer.cpp
+@@ -38,22 +38,42 @@ bool bit_at(std::span<const std::byte> f, std::size_t p) {
+     return (std::to_integer<std::uint32_t>(f[p >> 3]) >> (7 - (p & 7))) & 1;
+ }
+ 
+-// Everything sign_atmos_frame and verify_atmos_frame both need: the parsed
+-// frame, the tag it computes from A||B, and where in the frame that tag
+-// belongs. Signing writes `digest` into the frame at `prim_off`; verifying
+-// reads what is already there at `prim_off` and compares. Neither the parse
+-// nor the HMAC construction differs between the two operations - only what
+-// happens with the result - so this is the one place that logic lives.
+-// nullopt means "no container to sign/verify", the same as the layout's own
+-// has_container.
+-struct TagContext {
++// One protection field: `bits` bits of `digest`, MSB-first, at frame bit
++// `start`.
++struct TagField {
++    std::size_t start;
++    std::size_t bits;
+     std::array<std::byte, 32> digest;
+-    int np;
+-    std::size_t prim_off;
+ };
+ 
+-std::optional<TagContext> compute_tag_context(std::span<const std::byte> frame,
+-                                               const base::crypto::SigningKey& key) {
++// Bounds-checked like bit_at(): a well-formed match from walk_frame's
++// single-container-per-frame rule never reaches the out-of-range branch, and
++// a write past the end would corrupt the wrong memory, so it skips.
++void write_tag(std::span<std::byte> frame, const TagField& field) {
++    for (std::size_t i = 0; i < field.bits; ++i) {
++        const std::size_t q = field.start + i;
++        if ((q >> 3) >= frame.size()) continue;
++        const std::byte mask{static_cast<std::uint8_t>(0x80u >> (q & 7))};
++        if (bit_at(field.digest, i))
++            frame[q >> 3] |= mask;
++        else
++            frame[q >> 3] &= ~mask;
++    }
++}
++
++bool tag_matches(std::span<const std::byte> frame, const TagField& field) {
++    for (std::size_t i = 0; i < field.bits; ++i)
++        if (bit_at(frame, field.start + i) != bit_at(field.digest, i)) return false;
++    return true;
++}
++
++// The parse and HMAC construction sign_atmos_frame and verify_atmos_frame
++// share: the primary and secondary protection fields, in frame order, each
++// with the digest its bits come from. Signing writes them; verifying compares
++// them with what the frame holds. nullopt means "no container to
++// sign/verify", the same as the layout's own has_container.
++std::optional<std::array<TagField, 2>> compute_tag_fields(std::span<const std::byte> frame,
++                                                          const base::crypto::SigningKey& key) {
+     const FrameLayout p = ac3::emdf::walk_frame(frame);
+     // A frame outside the walker's scope, or one whose fields stopped making
+     // sense part-way through, reports no container - so it is left unsigned
+@@ -105,7 +125,19 @@ std::optional<TagContext> compute_tag_context(std::span<const std::byte> frame,
+     for (std::uint8_t x : b_bytes) msg.push_back(std::byte{x});
+ 
+     const std::size_t prim_off = p.container_start + pb - std::size_t(np) - std::size_t(ms);
+-    return TagContext{.digest = base::crypto::hmac_sha256(key.bytes(), msg), .np = np, .prim_off = prim_off};
++    const auto digest = base::crypto::hmac_sha256(key.bytes(), msg);
++    // The secondary field takes the top bits of a second HMAC over the full
++    // 32-byte primary digest, not the np-bit truncation the frame carries.
++    // TS 102 366 §H.2.2.4 leaves the protection content implementation-
++    // defined; this derivation is what a licensed reference encoder's signed
++    // frames carry, validated bit-exactly against them (see the provenance
++    // note in docs/library/signing.md).
++    return std::array{
++        TagField{.start = prim_off, .bits = std::size_t(np), .digest = digest},
++        TagField{.start = prim_off + std::size_t(np),
++                 .bits = std::size_t(ms),
++                 .digest = base::crypto::hmac_sha256(key.bytes(), digest)},
++    };
+ }
+ 
+ }  // namespace
+@@ -151,27 +183,10 @@ bool has_authenticity_tag(std::span<const std::byte> frame) {
+ 
+ bool sign_atmos_frame(std::span<std::byte> frame, const base::crypto::SigningKey& key) {
+     if (key.empty()) return false;
+-    const auto ctx = compute_tag_context(frame, key);
+-    if (!ctx) return false;
++    const auto fields = compute_tag_fields(frame, key);
++    if (!fields) return false;
+ 
+-    // write protection_bits_primary (np bits) at prim_off. Bounds-checked for
+-    // the same reason bit_at() is: this indexes `frame` directly. A
+-    // well-formed match from walk_frame's single-container-per-frame rule
+-    // should never actually reach the out-of-range branch, but a write past
+-    // the end would corrupt the wrong memory rather than just read garbage,
+-    // so this one fails safe by skipping instead of clamping.
+-    for (int i = 0; i < ctx->np; ++i) {
+-        std::size_t q = ctx->prim_off + std::size_t(i);
+-        if ((q >> 3) >= frame.size()) continue;
+-        const bool bit = (std::to_integer<std::uint32_t>(ctx->digest[std::size_t(i / 8)]) >>
+-                          (7 - (i & 7))) &
+-                         1;
+-        std::byte& byte = frame[q >> 3];
+-        if (bit)
+-            byte |= static_cast<std::byte>(1u << (7 - (q & 7)));
+-        else
+-            byte &= static_cast<std::byte>(~(1u << (7 - (q & 7))) & 0xFFu);
+-    }
++    for (const TagField& field : *fields) write_tag(frame, field);
+     // recompute crc2 (last two bytes; covers everything after the 16-bit sync)
+     const std::uint16_t c = crc16(std::span<const std::byte>(frame).subspan(2, frame.size() - 4));
+     frame[frame.size() - 2] = std::byte(c >> 8);
+@@ -193,21 +208,13 @@ int sign_atmos_stream(std::span<std::byte> stream, const base::crypto::SigningKe
+ }
+ 
+ VerifyResult verify_atmos_frame(std::span<const std::byte> frame, const base::crypto::SigningKey& key) {
+-    const auto ctx = compute_tag_context(frame, key);
+-    if (!ctx) return VerifyResult::kNoContainer;
++    const auto fields = compute_tag_fields(frame, key);
++    if (!fields) return VerifyResult::kNoContainer;
+ 
+-    // Compare the digest just computed against whatever tag bits the frame
+-    // already carries at prim_off - unlike sign_atmos_frame, nothing here is
+-    // written back.
+-    for (int i = 0; i < ctx->np; ++i) {
+-        const std::size_t q = ctx->prim_off + std::size_t(i);
+-        const bool actual = bit_at(frame, q);
+-        const bool expected = (std::to_integer<std::uint32_t>(ctx->digest[std::size_t(i / 8)]) >>
+-                               (7 - (i & 7))) &
+-                              1;
+-        if (actual != expected) return VerifyResult::kMismatch;
+-    }
+-    return VerifyResult::kValid;
++    // Unlike sign_atmos_frame, nothing here is written back.
++    const bool valid = std::ranges::all_of(
++        *fields, [&](const TagField& field) { return tag_matches(frame, field); });
++    return valid ? VerifyResult::kValid : VerifyResult::kMismatch;
+ }
+ 
+ VerifySummary verify_atmos_stream(std::span<const std::byte> stream, const base::crypto::SigningKey& key) {
+diff --git a/libs/ac3/tests/signing/test_signing.cpp b/libs/ac3/tests/signing/test_signing.cpp
+index a43381c..8c9b9df 100644
+--- a/libs/ac3/tests/signing/test_signing.cpp
++++ b/libs/ac3/tests/signing/test_signing.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "iclforge/ac3/oba/atmos.hpp"
+ #include "iclforge/ac3/signing/emdf_atmos_signer.hpp"
++#include "iclforge/ac3/emdf/frame_layout.hpp"
+ #include "iclforge/ac3/encoder/eac3_frame.hpp"
+ #include "iclforge/ac3/meta/bsi.hpp"
+ #include "iclforge/base/crypto/signing_key.hpp"
+@@ -292,3 +293,30 @@ TEST_CASE("signing covers frames that carry info metadata, minus the element its
+               iclforge::ac3::signing::VerifyResult::kMismatch);
+     }
+ }
++
++// The container's secondary protection field is not filler: signing writes
++// the top bits of a second HMAC over the primary digest, and verification
++// checks them the same way it checks the primary.
++TEST_CASE("the secondary protection tag is written and checked", "[signing][emdf][verify]") {
++    const std::vector<std::byte> original = encode_atmos_stream(2, /*emit_objects=*/true);
++    REQUIRE_FALSE(original.empty());
++    const iclforge::base::crypto::SigningKey key = make_key(0x55);
++
++    std::vector<std::byte> signed_stream = original;
++    REQUIRE(iclforge::ac3::signing::sign_atmos_stream(signed_stream, key) == 2);
++    CHECK(iclforge::ac3::signing::verify_atmos_frame(signed_stream, key) ==
++          iclforge::ac3::signing::VerifyResult::kValid);
++
++    // The secondary field is the tail of the container's parsed content: the
++    // last protection_secondary_code-declared bits of it. This project's own
++    // writer declares 32 primary + 8 secondary, code 1.
++    const auto layout = iclforge::ac3::emdf::walk_frame(signed_stream);
++    REQUIRE(layout.supported);
++    REQUIRE(layout.has_container);
++    REQUIRE(layout.protection_secondary_code == 1);
++    const std::size_t sec_off = layout.container_start + layout.container_parsed_bits - 8;
++
++    const auto tampered = with_bit_flipped(signed_stream, sec_off);
++    CHECK(iclforge::ac3::signing::verify_atmos_frame(tampered, key) ==
++          iclforge::ac3::signing::VerifyResult::kMismatch);
++}
